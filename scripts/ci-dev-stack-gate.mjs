@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -172,7 +172,23 @@ async function verifyResetCleanup() {
     throw new Error(`State root still exists after reset: ${config.stateRoot}`);
   }
 
-  console.log("Reset cleanup verified cleanly!");
+  // Assert Compose project has no lingering containers
+  const psCheck = spawnSync("docker", ["compose", "-p", config.composeProject, "ps", "-a", "-q"], {
+    encoding: "utf8"
+  });
+  if (psCheck.status === 0 && psCheck.stdout.trim().length > 0) {
+    throw new Error(`Compose project containers still exist after reset: ${psCheck.stdout.trim()}`);
+  }
+
+  // Assert Compose project has no lingering volumes
+  const volCheck = spawnSync("docker", ["volume", "ls", "--filter", `label=com.docker.compose.project=${config.composeProject}`, "-q"], {
+    encoding: "utf8"
+  });
+  if (volCheck.status === 0 && volCheck.stdout.trim().length > 0) {
+    throw new Error(`Compose project volumes still exist after reset: ${volCheck.stdout.trim()}`);
+  }
+
+  console.log("Reset cleanup verified cleanly (state directory, containers, and volumes absent)!");
 }
 
 /**
