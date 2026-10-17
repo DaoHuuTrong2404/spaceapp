@@ -71,7 +71,7 @@ npm run dev:stack
 This single command:
 1. Generates an isolated state directory in `.dev-stack/` with secure 0600 credentials.
 2. Automatically extracts and starts containerized dependencies using the pinned image digests from the compose template.
-3. Installs the pinned OpenCode CLI locally in `.dev-stack/opencode` (with VS Code parity) without polluting global `PATH`.
+3. Installs the pinned OpenCode CLI locally in `.dev-stack/opencode` providing a fully isolated terminal interface without polluting global `PATH`.
 4. Builds internal monorepo packages (`@space/*`).
 5. Runs database migrations against the isolated development database.
 6. Starts the background Temporal worker, API service, and Vite web development server with hot-module replacement.
@@ -117,13 +117,26 @@ The development stack runs isolated defaults out of the box, but can be customiz
 | `SPACE_DEV_TEMPORAL_PORT` | `57233` | Host loopback port for Temporal gRPC |
 | `SPACE_DEV_STATE_DIR` | `.dev-stack` | Root directory for isolated secrets, logs, and runtimes |
 
-### Watching monorepo packages
+### Package development and hot reload
 
-When modifying code in `packages/*`, run the package builder in watch mode in a separate terminal:
-```sh
-npm run watch:packages
-```
-This automatically rebuilds `@space/*` packages on changes so the running API server and worker pick up updates.
+- **Frontend (Web UI)**: Vite provides instant Hot Module Replacement (HMR) for edits in `apps/web`.
+- **Internal packages (`packages/*`)**: To continuously compile `@space/*` packages while making changes across packages, run:
+  ```sh
+  npm run watch:packages
+  ```
+  Because the background worker and CLI host run plain Node.js, they load compiled modules at process startup. After modifying monorepo packages, apply the updates across all running services by restarting the stack:
+  ```sh
+  npm run dev:stack -- down && npm run dev:stack
+  ```
+
+### Troubleshooting
+
+- **Docker daemon / Compose**: Ensure Docker is running (`docker info`) and the compose plugin is accessible (`docker compose version`). On Linux, ensure your user belongs to the `docker` group or has permission to communicate with the Docker socket.
+- **Port conflicts**: By default, `dev:stack` binds loopback ports `5911` (Web), `5910` (API), `54329` (Postgres), and `57233` (Temporal). If a port is occupied by another application, override it using environment variables (e.g. `SPACE_DEV_WEB_PORT=5921 SPACE_DEV_API_PORT=5920 npm run dev:stack`).
+- **Permissions and state directory**: State and credentials reside in `.dev-stack/` with owner-only `0600` permissions. If you encounter permission errors or need a fresh state, run `npm run dev:stack -- reset`.
+- **Service readiness timeouts**: On slower machines or initial image pull, container initialization may take longer. You can monitor container logs via `docker compose -p spaceapp-dev -f .dev-stack/docker-compose.yml logs -f`.
+- **macOS (Colima / Docker Desktop)**: Ensure port forwarding and loopback bindings `127.0.0.1` are enabled. If using Colima, verify `colima status` and ensure adequate memory allocation (>= 4GB recommended).
+- **Windows 11 (WSL2)**: Run `npm run dev:stack` inside your WSL2 Linux distribution (e.g. Ubuntu) with Docker Desktop WSL2 integration enabled or Docker Engine running inside WSL2. Native Windows command prompt lacks POSIX permission primitives for 0600 secret files.
 
 ## Make and verify a small change
 

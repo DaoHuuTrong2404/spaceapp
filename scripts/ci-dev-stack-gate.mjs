@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import process from "node:process";
 import { resolveDevStackConfig, stopDevStack } from "./dev-stack.mjs";
@@ -34,7 +35,12 @@ async function waitForReadyz(maxWaitMs = 150000) {
       if (res.ok) {
         const body = await res.json();
         if (body.ok === true) {
-          console.log("Readyz check PASSED:", JSON.stringify(body));
+          console.log("Readyz check PASSED:", JSON.stringify({
+            ok: body.ok,
+            store: body.dependencies?.runtimeStore || body.dependencies?.store,
+            database: body.dependencies?.database,
+            worker: body.dependencies?.worker
+          }));
           return true;
         }
       }
@@ -50,7 +56,7 @@ async function waitForReadyz(maxWaitMs = 150000) {
  * Claims the initial owner account using the generated setup token.
  *
  * @param {string} setupToken - Raw token read from secrets/setup-token.
- * @returns {Promise<{ claimData: any, cookie: string | null }>}
+ * @returns {Promise<any>}
  * @throws {Error} If the claim request fails.
  */
 async function claimOwner(setupToken) {
@@ -71,26 +77,83 @@ async function claimOwner(setupToken) {
   }
 
   const claimData = await claimRes.json();
-  const setCookie = claimRes.headers.get("set-cookie");
   console.log("Owner claimed successfully. User:", claimData.user?.email);
-  return { claimData, cookie: setCookie };
+  return claimData;
+}
+
+/**
+ * Authenticates the owner account independently and extracts the session cookie.
+ *
+ * @param {string} email
+ * @param {string} password
+ * @returns {Promise<string>} Clean session cookie string (name=value).
+ */
+async function loginOwner(email, password) {
+  console.log("Logging in owner account over HTTP to verify credentials...");
+  const loginRes = await fetch(`${API_ORIGIN}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password })
+  });
+
+  if (!loginRes.ok) {
+    const errorText = await loginRes.text();
+    throw new Error(`Owner login failed (${loginRes.status}): ${errorText}`);
+  }
+
+  const setCookie = loginRes.headers.get("set-cookie");
+  if (!setCookie) {
+    throw new Error("Owner login succeeded but set-cookie header was not returned by API.");
+  }
+
+  const sessionCookie = setCookie.split(";")[0].trim();
+  console.log("Owner login succeeded. Acquired session cookie.");
+  return sessionCookie;
+}
+
+/**
+ * Retrieves the CSRF token and header name for authenticated mutations.
+ *
+ * @param {string} sessionCookie
+ * @returns {Promise<{ csrfToken: string, headerName: string }>}
+ */
+async function getCsrf(sessionCookie) {
+  console.log("Fetching CSRF token from /api/auth/csrf...");
+  const csrfRes = await fetch(`${API_ORIGIN}/api/auth/csrf`, {
+    headers: { Cookie: sessionCookie }
+  });
+
+  if (!csrfRes.ok) {
+    const errorText = await csrfRes.text();
+    throw new Error(`Failed to fetch CSRF token (${csrfRes.status}): ${errorText}`);
+  }
+
+  const csrfData = await csrfRes.json();
+  if (!csrfData.csrfToken || !csrfData.headerName) {
+    throw new Error(`Invalid CSRF response format: ${JSON.stringify(csrfData)}`);
+  }
+
+  console.log(`CSRF token acquired (headerName: "${csrfData.headerName}").`);
+  return { csrfToken: csrfData.csrfToken, headerName: csrfData.headerName };
 }
 
 /**
  * Ensures a starter room exists, verifies an OpenCode CLI pane is active,
  * and asserts that the CLI session endpoint returns a valid session.
  *
- * @param {string | null} cookie - Session cookie from owner claim.
+ * @param {string} sessionCookie - Session cookie from owner login.
+ * @param {{ csrfToken: string, headerName: string }} csrf - CSRF token credentials.
  * @returns {Promise<void>}
  * @throws {Error} If starter room creation, pane query, or CLI session verification fails.
  */
-async function verifyStarterRoomAndCliPane(cookie) {
+async function verifyStarterRoomAndCliPane(sessionCookie, csrf) {
   console.log("Ensuring starter room and verifying CLI pane...");
   const roomRes = await fetch(`${API_ORIGIN}/api/setup/starter-room`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Cookie: cookie || ""
+      Cookie: sessionCookie,
+      [csrf.headerName]: csrf.csrfToken
     }
   });
 
@@ -103,28 +166,30 @@ async function verifyStarterRoomAndCliPane(cookie) {
   const roomId = roomData.room.id;
   console.log(`Starter room ensured: "${roomData.room.name}" (${roomId})`);
 
-  // List panes in the room
-  const panesRes = await fetch(`${API_ORIGIN}/api/rooms`, {
-    headers: { Cookie: cookie || "" }
+  // Query Getting Started panes via /api/panes?roomId=...
+  const panesRes = await fetch(`${API_ORIGIN}/api/panes?roomId=${encodeURIComponent(roomId)}`, {
+    headers: { Cookie: sessionCookie }
   });
   if (!panesRes.ok) {
     const errorText = await panesRes.text();
-    throw new Error(`Failed to list rooms (${panesRes.status}): ${errorText}`);
+    throw new Error(`Failed to list panes for room ${roomId} (${panesRes.status}): ${errorText}`);
   }
 
-  const allRooms = await panesRes.json();
-  const roomsList = Array.isArray(allRooms.data) ? allRooms.data : (Array.isArray(allRooms) ? allRooms : []);
-  const targetRoom = roomsList.find((r) => r.id === roomId) || allRooms.items?.find((r) => r.id === roomId) || roomData.room || {};
+  const panesJson = await panesRes.json();
+  const panesList = Array.isArray(panesJson.data) ? panesJson.data : (Array.isArray(panesJson) ? panesJson : []);
 
-  // Locate OpenCode CLI pane or create one if absent
-  let opencodePaneId = targetRoom.panes?.find((p) => p.terminalRuntimeId === "cli:opencode" || p.mode === "TERMINAL")?.id;
+  // Locate Getting Started OpenCode CLI pane
+  let opencodePane = panesList.find((p) => p.terminalRuntimeId === "cli:opencode");
+  let opencodePaneId = opencodePane?.id;
+
   if (!opencodePaneId) {
-    console.log("Creating OpenCode CLI pane in room...");
+    console.log("OpenCode CLI pane not present in initial room panes, creating pane...");
     const createPaneRes = await fetch(`${API_ORIGIN}/api/rooms/${encodeURIComponent(roomId)}/panes`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Cookie: cookie || ""
+        Cookie: sessionCookie,
+        [csrf.headerName]: csrf.csrfToken
       },
       body: JSON.stringify({
         panes: [
@@ -153,7 +218,8 @@ async function verifyStarterRoomAndCliPane(cookie) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Cookie: cookie || ""
+      Cookie: sessionCookie,
+      [csrf.headerName]: csrf.csrfToken
     },
     body: JSON.stringify({
       runtimeId: "cli:opencode"
@@ -170,7 +236,7 @@ async function verifyStarterRoomAndCliPane(cookie) {
   let activeSession = null;
   for (let attempt = 0; attempt < 15; attempt++) {
     const sessionRes = await fetch(`${API_ORIGIN}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/session`, {
-      headers: { Cookie: cookie || "" }
+      headers: { Cookie: sessionCookie }
     });
     if (sessionRes.ok) {
       lastSessionData = await sessionRes.json().catch(() => null);
@@ -225,10 +291,11 @@ async function verifyStarterRoomAndCliPane(cookie) {
   const webOrigin = `http://127.0.0.1:${config.webPort}`;
   const wsOrigin = webOrigin.replace(/^http/, "ws");
   const wsUrl = `${wsOrigin}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(wsToken)}`;
-  console.log(`Connecting to CLI terminal WebSocket via Vite proxy at ${wsUrl}...`);
+  const maskedWsUrl = `${wsOrigin}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(wsToken.slice(0, 6))}...`;
+  console.log(`Connecting to CLI terminal WebSocket via Vite proxy at ${maskedWsUrl}...`);
 
   // MUST NOT catch or swallow: must strictly fail the gate on error, timeout, or bad frames
-  const wsResult = await verifyCliWebSocketTransport(wsUrl, cookie, {
+  const wsResult = await verifyCliWebSocketTransport(wsUrl, sessionCookie, {
     expectedRuntimeId: "cli:opencode",
     expectedSessionId: sessionId,
     expectedPaneId: opencodePaneId
@@ -447,7 +514,20 @@ async function verifyResetCleanup(preRecordedPids = []) {
     throw new Error(`Compose project volumes still exist after reset: ${volCheck.stdout.trim()}`);
   }
 
-  console.log("Reset cleanup verified cleanly (state directory, child processes, containers, and volumes absent)!");
+  // Assert managed ports are completely released and no longer listening
+  for (const port of [config.apiPort, config.webPort, config.postgresPort, config.temporalPort]) {
+    const isBound = await new Promise((resolve) => {
+      const s = new net.Socket();
+      s.once("connect", () => { s.destroy(); resolve(true); });
+      s.once("error", () => { s.destroy(); resolve(false); });
+      s.connect(port, "127.0.0.1");
+    });
+    if (isBound) {
+      throw new Error(`Port 127.0.0.1:${port} is still listening after reset`);
+    }
+  }
+
+  console.log("Reset cleanup verified cleanly (state directory, child processes, containers, volumes, and listeners absent)!");
 }
 
 /**
@@ -501,8 +581,10 @@ async function main() {
     }
     const setupToken = readFileSync(tokenFile, "utf8").trim();
 
-    const { cookie } = await claimOwner(setupToken);
-    await verifyStarterRoomAndCliPane(cookie);
+    await claimOwner(setupToken);
+    const sessionCookie = await loginOwner("contributor@example.com", "DevPassword123!456");
+    const csrf = await getCsrf(sessionCookie);
+    await verifyStarterRoomAndCliPane(sessionCookie, csrf);
 
     if (unexpectedExitError) throw unexpectedExitError;
     console.log("All functional gate assertions PASSED!");

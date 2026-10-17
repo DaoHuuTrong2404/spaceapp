@@ -8,12 +8,14 @@ import {
   ensureSecrets,
   generateDevComposeYaml,
   isComposeServiceHealthy,
+  isManagedSocketPath,
   parsePinnedImages,
   parsePinnedOpencodeVersion,
   resolveCliHostSocketPath,
   resolveDevStackConfig,
   setupOpencodeWrapper,
   startDevStack,
+  stopDevStack,
   validatePort
 } from "../dev-stack.mjs";
 
@@ -267,8 +269,7 @@ test("assertSafeStateDir prevents accidental deletion of root, home, ancestors, 
   assert.throws(() => assertSafeStateDir(path.join(repoRoot, "scripts", "dev-stack.mjs"), repoRoot), /Refusing to delete protected repository source subtree/);
 
   // Safe directories must not throw
-  const tmpDir = path.join(os.tmpdir(), "safe-test-dev-stack");
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-safe-test-"));
   try {
     assert.doesNotThrow(() => assertSafeStateDir(tmpDir, repoRoot));
     assert.doesNotThrow(() => assertSafeStateDir(path.join(repoRoot, ".dev-stack"), repoRoot));
@@ -280,8 +281,7 @@ test("assertSafeStateDir prevents accidental deletion of root, home, ancestors, 
   }
 
   // Invalid marker throws
-  const tmpMarkerDir = path.join(os.tmpdir(), "marker-test-dev-stack");
-  fs.mkdirSync(tmpMarkerDir, { recursive: true });
+  const tmpMarkerDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-marker-test-"));
   try {
     fs.writeFileSync(path.join(tmpMarkerDir, ".dev-stack-state.json"), JSON.stringify({ createdBy: "malicious" }));
     assert.throws(() => assertSafeStateDir(tmpMarkerDir, repoRoot, { requireMarker: true }), /Refusing to delete state directory with invalid marker/);
@@ -613,11 +613,34 @@ test("startDevStack adopts and initializes non-existent fresh state directory an
     const composeYaml = fs.readFileSync(composePath, "utf8");
     assert.match(composeYaml, /postgres:/);
     assert.match(composeYaml, /temporal:/);
+    assert.match(composeYaml, /DEFAULT_NAMESPACE: dev/);
+    assert.match(composeYaml, /--namespace dev/);
 
-    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "postgres-password")), "postgres-password must exist");
-    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "session-secret")), "session-secret must exist");
-    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "setup-token")), "setup-token must exist");
-    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "database-url")), "database-url must exist");
+    const pwFile = path.join(tmpRoot, "secrets", "postgres-password");
+    const sessionFile = path.join(tmpRoot, "secrets", "session-secret");
+    const tokenFile = path.join(tmpRoot, "secrets", "setup-token");
+    const dbUrlFile = path.join(tmpRoot, "secrets", "database-url");
+
+    assert.ok(fs.existsSync(pwFile), "postgres-password must exist");
+    assert.ok(fs.existsSync(sessionFile), "session-secret must exist");
+    assert.ok(fs.existsSync(tokenFile), "setup-token must exist");
+    assert.ok(fs.existsSync(dbUrlFile), "database-url must exist");
+
+    // Assert 0600 owner-only permissions on POSIX
+    if (process.platform !== "win32") {
+      assert.equal(fs.statSync(pwFile).mode & 0o777, 0o600, "postgres-password must have 0600 mode");
+      assert.equal(fs.statSync(sessionFile).mode & 0o777, 0o600, "session-secret must have 0600 mode");
+      assert.equal(fs.statSync(tokenFile).mode & 0o777, 0o600, "setup-token must have 0600 mode");
+      assert.equal(fs.statSync(dbUrlFile).mode & 0o777, 0o600, "database-url must have 0600 mode");
+    }
+
+    // Verify secrets are preserved across restart/ensureSecrets
+    const secrets1 = ensureSecrets(config);
+    const secrets2 = ensureSecrets(config);
+    assert.equal(secrets1.password, secrets2.password, "Password must persist across ensureSecrets");
+    assert.equal(secrets1.sessionSecret, secrets2.sessionSecret, "Session secret must persist across ensureSecrets");
+    assert.equal(secrets1.databaseUrl, secrets2.databaseUrl, "Database URL must persist across ensureSecrets");
+    assert.equal(secrets1.setupToken, secrets2.setupToken, "Setup token must persist across ensureSecrets");
   } finally {
     try {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -650,5 +673,124 @@ test("startDevStack refuses non-empty directory lacking marker without writing l
     assert.equal(fs.existsSync(lockFile), false, "dev-stack.lock must NOT be created in a foreign directory");
   } finally {
     fs.rmSync(tmpForeign, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that stopDevStack preserves external regular files or paths outside stateRoot
+ * when configured as cliSocketPath, preventing accidental deletion of user files.
+ */
+test("stopDevStack preserves external regular files passed as cliSocketPath", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-socket-state-"));
+  const tmpOutside = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-socket-out-"));
+
+  try {
+    // Write valid marker so assertSafeStateDir allows purge
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+
+    const importantFile = path.join(tmpOutside, "unrelated-config.txt");
+    fs.writeFileSync(importantFile, "critical data");
+
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState,
+      SPACE_DEV_CLI_SOCKET_PATH: importantFile
+    });
+
+    // Run stopDevStack with purge
+    await stopDevStack(config, {
+      purge: true,
+      runCmd: () => ({ status: 0 })
+    });
+
+    // Assert external file was preserved and NOT deleted
+    assert.equal(fs.existsSync(importantFile), true, "External regular file must not be deleted during reset");
+    assert.equal(fs.readFileSync(importantFile, "utf8"), "critical data");
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+    fs.rmSync(tmpOutside, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that stopDevStack propagates Docker failures for both down and reset,
+ * and does not release lock or purge state if Docker teardown fails.
+ */
+test("stopDevStack propagates Docker teardown failures for down and reset", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-docker-fail-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    fs.writeFileSync(path.join(tmpState, "docker-compose.yml"), "services: {}");
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid }));
+
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+
+    // 1. Down command failure propagation
+    await assert.rejects(
+      async () => {
+        await stopDevStack(config, {
+          purge: false,
+          runCmd: () => ({ status: 1 })
+        });
+      },
+      /Failed to tear down Docker Compose services/
+    );
+    // Lock must be retained when stop failed
+    assert.equal(fs.existsSync(lockFile), true, "Lock file must remain when Docker stop fails");
+
+    // 2. Reset (purge) failure propagation
+    await assert.rejects(
+      async () => {
+        await stopDevStack(config, {
+          purge: true,
+          runCmd: () => ({ status: 1 })
+        });
+      },
+      /Failed to tear down Docker Compose services/
+    );
+    // State directory must NOT be purged when Docker teardown fails
+    assert.equal(fs.existsSync(tmpState), true, "State directory must not be purged when Docker down fails");
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that young or active lock prevents duplicate stack launch and contender
+ * does not remove or alter the owner's active lock.
+ */
+test("startDevStack prevents concurrent execution when active lock is held", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-concurrent-"));
+  try {
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    const activePayload = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() });
+    fs.writeFileSync(lockFile, activePayload);
+
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: () => {}
+        });
+      },
+      /already running in state directory|Refusing to adopt non-empty/
+    );
+
+    // Assert owner's lock was NOT modified or unlinked
+    assert.equal(fs.existsSync(lockFile), true, "Owner lock must remain untouched");
+    assert.equal(fs.readFileSync(lockFile, "utf8"), activePayload);
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
   }
 });

@@ -176,9 +176,10 @@ services:
       POSTGRES_USER: spaceapp
       POSTGRES_SEEDS: postgres
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/docker.yaml
+      DEFAULT_NAMESPACE: dev
     entrypoint: ["/bin/sh", "-ec"]
     command:
-      - export POSTGRES_PWD="$$(cat /run/secrets/postgres-password)"; if id temporal >/dev/null 2>&1; then exec su -s /bin/sh temporal -c 'export POSTGRES_PWD="$$POSTGRES_PWD"; exec /etc/temporal/entrypoint.sh autosetup'; else exec /etc/temporal/entrypoint.sh autosetup; fi
+      - export POSTGRES_PWD="$$(cat /run/secrets/postgres-password)"; export DEFAULT_NAMESPACE="dev"; if id temporal >/dev/null 2>&1; then exec su -s /bin/sh temporal -c 'export POSTGRES_PWD="$$POSTGRES_PWD"; export DEFAULT_NAMESPACE="dev"; exec /etc/temporal/entrypoint.sh autosetup'; else exec /etc/temporal/entrypoint.sh autosetup; fi
     secrets:
       - source: postgres-password
         target: /run/secrets/postgres-password
@@ -186,7 +187,7 @@ services:
     ports:
       - "127.0.0.1:${temporalPort}:7233"
     healthcheck:
-      test: ["CMD-SHELL", "temporal operator cluster health --address temporal:7233 >/dev/null && temporal operator namespace describe --namespace default --address temporal:7233 >/dev/null"]
+      test: ["CMD-SHELL", "temporal operator cluster health --address temporal:7233 >/dev/null && temporal operator namespace describe --namespace dev --address temporal:7233 >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 25
@@ -591,17 +592,146 @@ export function assertSafeStateDir(stateRoot, repoRoot = ROOT, { requireMarker =
 }
 
 /**
+ * Verifies that a socket path is managed by dev-stack and is a socket file.
+ * Returns false if the path does not exist, is a regular file, or lies outside
+ * stateRoot and the temporary managed socket directory.
+ *
+ * @param {string | undefined} socketPath
+ * @param {ReturnType<typeof resolveDevStackConfig>} config
+ * @returns {boolean}
+ */
+export function isManagedSocketPath(socketPath, config) {
+  if (!socketPath || !existsSync(socketPath)) return false;
+  try {
+    const stat = statSync(socketPath);
+    if (process.platform !== "win32" && !stat.isSocket()) {
+      return false;
+    }
+    const resolved = path.resolve(socketPath);
+    const inStateRoot = resolved.startsWith(path.resolve(config.stateRoot) + path.sep);
+    const inTmpManaged = resolved.startsWith(path.resolve(os.tmpdir(), `spaceapp-${config.composeProject}`));
+    return inStateRoot || inTmpManaged;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Checks whether a PID corresponds to a known dev-stack process.
+ * Used before signaling processes from stale or unverified pidfiles.
+ *
+ * @param {number} pid
+ * @param {string} [expectedName]
+ * @returns {boolean}
+ */
+export function isDevStackProcess(pid, expectedName) {
+  if (!pid || typeof pid !== "number") return false;
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    if (process.platform === "linux") {
+      if (existsSync(`/proc/${pid}/cmdline`)) {
+        const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
+        if (!cmd) return false;
+        return (
+          cmd.includes("spaceapp") ||
+          cmd.includes("dev-stack") ||
+          cmd.includes("node") ||
+          cmd.includes("vite") ||
+          cmd.includes("@space") ||
+          (expectedName && cmd.includes(expectedName))
+        );
+      }
+      return true;
+    } else if (process.platform === "win32") {
+      const res = spawnSync("powershell", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`], {
+        encoding: "utf8",
+        timeout: 2000
+      });
+      if (res.stdout) {
+        const cmd = res.stdout.toLowerCase();
+        return cmd.includes("node") || cmd.includes("space") || cmd.includes("vite") || cmd.includes("dev-stack");
+      }
+      return false;
+    } else if (process.platform === "darwin") {
+      const res = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000 });
+      if (res.stdout) {
+        const cmd = res.stdout;
+        return cmd.includes("node") || cmd.includes("space") || cmd.includes("vite") || cmd.includes("dev-stack");
+      }
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Stops running dev-stack child processes and Docker Compose services.
  *
  * @param {ReturnType<typeof resolveDevStackConfig>} config
- * @param {{ purge?: boolean }} [options]
+ * @param {{ purge?: boolean, runCmd?: typeof runCommand }} [options]
  * @returns {Promise<void>}
  */
-export async function stopDevStack(config, { purge = false } = {}) {
+export async function stopDevStack(config, { purge = false, runCmd = runCommand } = {}) {
   // CRITICAL: Validate state directory and ownership marker BEFORE any destructive action
   assertSafeStateDir(config.stateRoot, ROOT, { requireMarker: purge });
 
   const composeFile = path.join(config.stateRoot, "docker-compose.yml");
+  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+
+  // Coordinate with running supervisor if active
+  let supervisorPid = null;
+  if (existsSync(lockFile)) {
+    try {
+      const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
+      if (typeof lockData?.pid === "number") {
+        supervisorPid = lockData.pid;
+      }
+    } catch {}
+  }
+
+  if (supervisorPid && supervisorPid !== process.pid) {
+    let supervisorAlive = false;
+    try {
+      process.kill(supervisorPid, 0);
+      supervisorAlive = true;
+    } catch {}
+
+    if (supervisorAlive && isDevStackProcess(supervisorPid, "dev-stack")) {
+      console.log(`Coordinating graceful shutdown with supervisor (PID: ${supervisorPid})...`);
+      const reqFile = path.join(config.runDir, "shutdown.req");
+      try {
+        writeFileSync(reqFile, JSON.stringify({ requestedAt: Date.now(), purge }));
+      } catch {}
+
+      try {
+        process.kill(supervisorPid, "SIGTERM");
+      } catch {}
+
+      const supervisorDeadline = Date.now() + 10000;
+      while (Date.now() < supervisorDeadline) {
+        try {
+          process.kill(supervisorPid, 0);
+          await new Promise((r) => setTimeout(r, 200));
+        } catch {
+          supervisorAlive = false;
+          break;
+        }
+      }
+
+      if (!supervisorAlive) {
+        if (!purge) {
+          return;
+        }
+      }
+    }
+  }
+
   console.log("Stopping dev-stack processes and containers...");
 
   // Kill running child processes if pidfile exists, and WAIT for them to exit with deadline & escalation
@@ -609,7 +739,16 @@ export async function stopDevStack(config, { purge = false } = {}) {
     let recordedPids = [];
     try {
       const pids = JSON.parse(readFileSync(config.pidFile, "utf8"));
-      recordedPids = Object.values(pids).filter((p) => typeof p === "number");
+      for (const [name, val] of Object.entries(pids)) {
+        const pid = typeof val === "number" ? val : val?.pid;
+        if (typeof pid === "number") {
+          if (isDevStackProcess(pid, name)) {
+            recordedPids.push(pid);
+          } else {
+            console.warn(`[dev-stack] Skipping unverified PID ${pid} (${name}); not identified as dev-stack process.`);
+          }
+        }
+      }
       for (const pid of recordedPids) {
         try {
           if (process.platform === "win32") {
@@ -702,14 +841,13 @@ export async function stopDevStack(config, { purge = false } = {}) {
     } else {
       args.push("stop");
     }
-    const res = spawnSync("docker", args, { stdio: "inherit" });
-    if (purge && res.status !== 0) {
-      throw new Error(`Failed to tear down Docker Compose services (exit code ${res.status}). Aborting state purge to prevent data loss.`);
+    const res = runCmd("docker", args, { stdio: "inherit" });
+    if (res && typeof res.status === "number" && res.status !== 0) {
+      throw new Error(`Failed to tear down Docker Compose services (${args.join(" ")}): exit code ${res.status}`);
     }
   }
 
   // Release state lock ONLY AFTER Docker teardown is completely finished, and only by owner unless purging
-  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
   if (existsSync(lockFile)) {
     try {
       if (purge) {
@@ -734,9 +872,13 @@ export async function stopDevStack(config, { purge = false } = {}) {
     console.log(`Purging state directory: ${config.stateRoot}`);
     rmSync(config.stateRoot, { recursive: true, force: true });
     if (config.cliSocketPath && existsSync(config.cliSocketPath)) {
-      try {
-        rmSync(config.cliSocketPath, { force: true });
-      } catch {}
+      if (isManagedSocketPath(config.cliSocketPath, config)) {
+        try {
+          rmSync(config.cliSocketPath, { force: true });
+        } catch {}
+      } else {
+        console.log(`Preserving unmanaged or non-socket path: ${config.cliSocketPath}`);
+      }
     }
   }
 }
@@ -818,10 +960,30 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         throw new Error(`Dev stack startup is already in progress in state directory ${config.stateRoot}. Refusing concurrent start.`);
       }
 
-      // Stale dead lock (>15s old): remove and retry once
+      // Stale dead lock (>15s old): atomically rename to serialize reclaim and avoid race with fresh creator
+      const reclaimPath = path.join(config.stateRoot, `dev-stack.lock.reclaim.${process.pid}`);
       try {
-        rmSync(lockFile, { force: true });
-      } catch {}
+        renameSync(lockFile, reclaimPath);
+        const reclaimedContent = readFileSync(reclaimPath, "utf8").trim();
+        let isStale = false;
+        try {
+          const reclaimedData = JSON.parse(reclaimedContent);
+          if (reclaimedData.pid === parsedData?.pid) {
+            isStale = true;
+          }
+        } catch {
+          if (reclaimedContent === rawContent) isStale = true;
+        }
+
+        if (isStale) {
+          rmSync(reclaimPath, { force: true });
+        } else {
+          try { renameSync(reclaimPath, lockFile); } catch {}
+          throw new Error(`Concurrent lock acquisition detected in state directory ${config.stateRoot}. Refusing concurrent start.`);
+        }
+      } catch (renameErr) {
+        if (renameErr.message.includes("Concurrent lock acquisition")) throw renameErr;
+      }
     }
   }
 
@@ -833,28 +995,61 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
 
   const children = new Map();
   let stopping = false;
+  let shutdownPromise = null;
 
   function shutdown(signal = "SIGTERM", exitCode = 0) {
-    if (stopping) return;
+    if (shutdownPromise) return shutdownPromise;
     stopping = true;
     console.log(`\nStopping dev-stack (${signal})...`);
-    for (const [name, child] of children) {
-      try {
-        if (process.platform === "win32" && child.pid) {
-          spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
-        } else if (child.pid) {
-          child.kill(signal);
+    shutdownPromise = (async () => {
+      // Signal children once
+      for (const [name, child] of children) {
+        try {
+          if (process.platform === "win32" && child.pid) {
+            spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
+          } else if (child.pid) {
+            child.kill(signal);
+          }
+        } catch {}
+      }
+
+      // Wait for children to exit (up to 5s deadline)
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        let allExited = true;
+        for (const [name, child] of children) {
+          if (child.exitCode === null && child.signalCode === null) {
+            allExited = false;
+            break;
+          }
         }
-      } catch {}
-    }
-    stopDevStack(config, { purge: false }).then(() => {
+        if (allExited) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      try {
+        await stopDevStack(config, { purge: false, runCmd });
+      } catch (e) {
+        console.error("[dev-stack] Teardown error:", e.message);
+      }
       process.exit(exitCode);
-    });
+    })();
+    return shutdownPromise;
   }
 
   for (const sig of ["SIGINT", "SIGTERM"]) {
     process.once(sig, () => shutdown(sig, 0));
   }
+
+  // Periodic check for shutdown request from external down command
+  const shutdownReqFile = path.join(config.runDir, "shutdown.req");
+  const shutdownWatcher = setInterval(() => {
+    if (existsSync(shutdownReqFile)) {
+      try { rmSync(shutdownReqFile, { force: true }); } catch {}
+      shutdown("SIGTERM", 0);
+    }
+  }, 400);
+  shutdownWatcher.unref();
 
   try {
     const composeContent = readFileSync(TEMPLATE_COMPOSE_PATH, "utf8");
@@ -922,6 +1117,23 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
     SPACE_CLI_COMMAND_PATH: config.binDir,
     SPACE_CLI_WORKSPACE_ROOT: config.workspacesDir,
     SPACE_TEMPORAL_ADDRESS: `127.0.0.1:${config.temporalPort}`,
+    SPACE_RUNTIME_STORE: "postgres",
+    SPACE_INSTANCE: "dev",
+    SPACE_INSTANCE_ENABLED_JOBS: "",
+    SPACE_TEMPORAL_NAMESPACE: "dev",
+    SPACE_TEMPORAL_TASK_QUEUE: "space-dev-agent-turns",
+    SPACE_CLI_ROOT_ENABLED: "false",
+    SPACE_BROWSER_HOST_TRANSPORT: "disabled",
+    SPACE_BROWSER_SESSIONS_ENABLED: "false",
+    SPACE_DOT_TOOL_GATEWAY: "disabled",
+    SPACE_CLI_ADMIN_HOST_SOCKET: path.join(config.runDir, "admin-pane-host.sock"),
+    SPACE_WORKTREES_ROOT: path.join(config.varDir, "worktrees"),
+    SPACE_PERSONAL_GIT_ROOT: path.join(config.varDir, "personal-git"),
+    SPACE_DOT_WORKSPACE_ROOT: path.join(config.varDir, "dot-workspace"),
+    SPACE_USER_PROJECTS_ROOT: path.join(config.varDir, "user-projects"),
+    SPACE_CLI_RUNTIME_VISIBILITY_FILE: path.join(config.varDir, "cli-runtime-visibility.json"),
+    SPACE_PLUGIN_STORAGE_ROOT: path.join(config.varDir, "plugins"),
+    SPACE_PROVIDER_SKILL_LINKS_ROOT: path.join(config.varDir, "provider-skill-links"),
     SPACEAPP_WORKFLOWS_ENABLED: "true",
     SPACE_API_HOST: "127.0.0.1",
     SPACE_API_PORT: String(config.apiPort),
@@ -946,6 +1158,13 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
     SPACE_TELEGRAM_OWNERSHIP_MANIFEST: path.join(config.varDir, "telegram", "space-codex-thread-ownership.json"),
     SPACE_CODEX_HOME: path.join(config.varDir, "codex-home")
   };
+
+  mkdirSync(envCommon.SPACE_WORKTREES_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_PERSONAL_GIT_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_DOT_WORKSPACE_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_USER_PROJECTS_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_PLUGIN_STORAGE_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_PROVIDER_SKILL_LINKS_ROOT, { recursive: true });
 
   mkdirSync(envCommon.SPACE_MEMORY_ROOT, { recursive: true });
   mkdirSync(envCommon.SPACE_ARTIFACT_ROOT, { recursive: true });
@@ -1078,7 +1297,7 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         } catch {}
       }
       try {
-        await stopDevStack(config, { purge: false });
+        await stopDevStack(config, { purge: false, runCmd });
       } catch (cleanupErr) {
         console.error("[dev-stack] Error during rollback teardown:", cleanupErr.message);
       }
