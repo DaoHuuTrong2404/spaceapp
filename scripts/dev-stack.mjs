@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -736,8 +736,72 @@ export async function stopDevStack(config, { purge = false } = {}) {
 export async function startDevStack(config) {
   console.log("Starting SpaceApp dev-stack from source...");
 
-  // Validate stateRoot early
+  let ownsLifecycle = false;
+
+  // Validate stateRoot early and ensure base directory exists
   assertSafeStateDir(config.stateRoot, ROOT);
+  mkdirSync(config.stateRoot, { recursive: true, mode: 0o700 });
+
+  // Atomically acquire state lock using flag: 'wx' (O_CREAT | O_EXCL) before any state mutation
+  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+  const lockPayload = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n";
+  let lockAcquired = false;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(lockFile, lockPayload, { flag: "wx", mode: 0o600 });
+      lockAcquired = true;
+      break;
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+
+      // Lock file already exists: inspect recording PID
+      // Give concurrent creator up to 500ms to finish writing payload
+      let parsedData = null;
+      for (let r = 0; r < 5; r++) {
+        try {
+          const content = readFileSync(lockFile, "utf8").trim();
+          if (content.length > 0) {
+            parsedData = JSON.parse(content);
+            break;
+          }
+        } catch {}
+        await new Promise((res) => setTimeout(res, 100));
+      }
+
+      if (parsedData && typeof parsedData.pid === "number") {
+        let isAlive = false;
+        try {
+          process.kill(parsedData.pid, 0);
+          isAlive = true;
+        } catch {}
+        if (isAlive) {
+          throw new Error(`Dev stack is already running in state directory ${config.stateRoot} (PID: ${parsedData.pid}). Refusing to start duplicate stack.`);
+        }
+      }
+
+      // If the file is still unreadable, check its age before considering it corrupted
+      let fileAgeMs = 0;
+      try {
+        fileAgeMs = Date.now() - statSync(lockFile).mtimeMs;
+      } catch {}
+
+      if (fileAgeMs < 15000) {
+        throw new Error(`Dev stack startup is already in progress in state directory ${config.stateRoot}. Refusing concurrent start.`);
+      }
+
+      // Stale dead lock (>15s old): remove and retry once
+      try {
+        rmSync(lockFile, { force: true });
+      } catch {}
+    }
+  }
+
+  if (!lockAcquired) {
+    throw new Error(`Failed to acquire atomic state lock for directory ${config.stateRoot}`);
+  }
+
+  ownsLifecycle = true;
 
   const children = new Map();
   let stopping = false;
@@ -772,46 +836,6 @@ export async function startDevStack(config) {
     const opencodeVersion = parsePinnedOpencodeVersion(dockerfileContent);
 
     const secrets = ensureSecrets(config);
-
-    // Atomically acquire state lock using flag: 'wx' (O_CREAT | O_EXCL)
-    const lockFile = path.join(config.stateRoot, "dev-stack.lock");
-    const lockPayload = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n";
-    let lockAcquired = false;
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        writeFileSync(lockFile, lockPayload, { flag: "wx", mode: 0o600 });
-        lockAcquired = true;
-        break;
-      } catch (err) {
-        if (err.code !== "EEXIST") throw err;
-
-        // Lock file exists: check if recording PID is alive
-        try {
-          const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
-          if (lockData.pid && typeof lockData.pid === "number") {
-            let isAlive = false;
-            try {
-              process.kill(lockData.pid, 0);
-              isAlive = true;
-            } catch {}
-            if (isAlive) {
-              throw new Error(`Dev stack is already running in state directory ${config.stateRoot} (PID: ${lockData.pid}). Refusing to start duplicate stack.`);
-            }
-          }
-          // Stale lock: remove and retry once
-          rmSync(lockFile, { force: true });
-        } catch (readErr) {
-          if (readErr.message && readErr.message.includes("already running")) throw readErr;
-          // Corrupted lock file: remove and retry once
-          rmSync(lockFile, { force: true });
-        }
-      }
-    }
-
-    if (!lockAcquired) {
-      throw new Error(`Failed to acquire atomic state lock for directory ${config.stateRoot}`);
-    }
   const composeYaml = generateDevComposeYaml({
     postgresImage: images.postgres,
     temporalImage: images.temporal,
@@ -890,7 +914,9 @@ export async function startDevStack(config) {
     SPACE_CLI_VPN_LAUNCHER: path.join(config.binDir, "space-cli-vpn-launcher"),
     SPACE_CODEX_APP_SERVER_COMMAND: path.join(config.binDir, "codex-vscode-parity"),
     SPACE_CHESS_MOVE_SOCKET: "disabled",
-    SPACE_CHESS_CLI_WORKSPACE: path.join(config.varDir, "chess-workspace")
+    SPACE_CHESS_CLI_WORKSPACE: path.join(config.varDir, "chess-workspace"),
+    SPACE_TELEGRAM_OWNERSHIP_MANIFEST: path.join(config.varDir, "telegram", "space-codex-thread-ownership.json"),
+    SPACE_CODEX_HOME: path.join(config.varDir, "codex-home")
   };
 
   mkdirSync(envCommon.SPACE_MEMORY_ROOT, { recursive: true });
@@ -903,6 +929,8 @@ export async function startDevStack(config) {
   mkdirSync(envCommon.SPACE_DEMO_PROJECTS_ROOT, { recursive: true });
   mkdirSync(envCommon.SPACE_DEMO_PROJECTS_VAR_ROOT, { recursive: true });
   mkdirSync(envCommon.SPACE_PROJECTS_ROOT, { recursive: true });
+  mkdirSync(path.dirname(envCommon.SPACE_TELEGRAM_OWNERSHIP_MANIFEST), { recursive: true });
+  mkdirSync(envCommon.SPACE_CODEX_HOME, { recursive: true });
 
   // 1. CLI Host
   console.log("Spawning CLI Host...");
@@ -1003,6 +1031,9 @@ export async function startDevStack(config) {
   }
   console.log("Press Ctrl+C to stop the stack.\n");
   } catch (err) {
+    if (!ownsLifecycle) {
+      throw err;
+    }
     if (!stopping) {
       stopping = true;
       if (err.message && err.message.includes("already running")) {

@@ -228,21 +228,31 @@ async function verifyStarterRoomAndCliPane(cookie) {
   console.log(`Connecting to CLI terminal WebSocket via Vite proxy at ${wsUrl}...`);
 
   // MUST NOT catch or swallow: must strictly fail the gate on error, timeout, or bad frames
-  const wsResult = await verifyCliWebSocketTransport(wsUrl, cookie);
+  const wsResult = await verifyCliWebSocketTransport(wsUrl, cookie, {
+    expectedRuntimeId: "cli:opencode",
+    expectedSessionId: sessionId,
+    expectedPaneId: opencodePaneId
+  });
   console.log("Live WebSocket terminal transport verified via Vite proxy:", wsResult);
 }
 
 /**
  * Connects to the CLI terminal WebSocket endpoint and asserts receipt of
- * valid protocol handshake/output frames. Rejects on error frame, non-JSON text,
- * connection error, or timeout.
+ * valid protocol handshake and live non-empty terminal output frames.
+ * Rejects on error frame, fatal session status, non-JSON text, connection error,
+ * premature close, or timeout.
  *
  * @param {string} wsUrl - WebSocket URL with sessionId and token.
  * @param {string|null} [cookie] - Session cookie for authenticated connection.
- * @param {number} [timeoutMs=10000] - Timeout in milliseconds.
- * @returns {Promise<object>} Parsed valid frame received.
+ * @param {number|object} [optionsOrTimeout=10000] - Timeout in milliseconds or options object.
+ * @returns {Promise<object>} Parsed valid terminal output frame received.
  */
-async function verifyCliWebSocketTransport(wsUrl, cookie, timeoutMs = 10000) {
+async function verifyCliWebSocketTransport(wsUrl, cookie, optionsOrTimeout = 10000) {
+  const timeoutMs = typeof optionsOrTimeout === "number" ? optionsOrTimeout : (optionsOrTimeout?.timeoutMs ?? 10000);
+  const expectedRuntimeId = typeof optionsOrTimeout === "object" ? (optionsOrTimeout.expectedRuntimeId ?? "cli:opencode") : "cli:opencode";
+  const expectedSessionId = typeof optionsOrTimeout === "object" ? optionsOrTimeout.expectedSessionId : null;
+  const expectedPaneId = typeof optionsOrTimeout === "object" ? optionsOrTimeout.expectedPaneId : null;
+
   let WebSocketClient = globalThis.WebSocket;
   try {
     const wsMod = await import("ws");
@@ -256,12 +266,14 @@ async function verifyCliWebSocketTransport(wsUrl, cookie, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let ws = null;
+    let readyReceived = false;
+    let terminalOutputReceived = false;
 
     const timeout = setTimeout(() => {
       if (!settled) {
         settled = true;
         try { ws?.close(); } catch {}
-        reject(new Error(`Timeout (${timeoutMs}ms) waiting for WebSocket ready/output frame from CLI host`));
+        reject(new Error(`Timeout (${timeoutMs}ms) waiting for live terminal output frame from CLI host (readyReceived: ${readyReceived})`));
       }
     }, timeoutMs);
 
@@ -296,26 +308,49 @@ async function verifyCliWebSocketTransport(wsUrl, cookie, timeoutMs = 10000) {
       }
 
       if (msg.type === "error" || msg.error) {
-        return onFail(new Error(`Terminal websocket reported error frame: ${msg.error || JSON.stringify(msg)}`));
+        return onFail(new Error(`Terminal websocket reported error frame: ${msg.error || msg.message || JSON.stringify(msg)}`));
+      }
+
+      if (msg.type === "status" && (msg.status === "ERROR" || msg.status === "EXITED")) {
+        return onFail(new Error(`Terminal websocket reported fatal session status: ${msg.status} (reason: ${msg.statusReason || "none"})`));
+      }
+
+      if (msg.type === "ready") {
+        if (expectedRuntimeId && msg.runtimeId && msg.runtimeId !== expectedRuntimeId && !msg.runtimeId.includes("opencode")) {
+          return onFail(new Error(`Terminal websocket ready frame runtimeId mismatch: expected ${expectedRuntimeId}, got ${msg.runtimeId}`));
+        }
+        if (expectedSessionId && msg.sessionId && msg.sessionId !== expectedSessionId) {
+          return onFail(new Error(`Terminal websocket ready frame sessionId mismatch: expected ${expectedSessionId}, got ${msg.sessionId}`));
+        }
+        if (expectedPaneId && msg.paneId && msg.paneId !== expectedPaneId) {
+          return onFail(new Error(`Terminal websocket ready frame paneId mismatch: expected ${expectedPaneId}, got ${msg.paneId}`));
+        }
+        readyReceived = true;
+        try {
+          if (typeof ws.send === "function") {
+            ws.send(JSON.stringify({ type: "input", data: "\n" }));
+          }
+        } catch (err) {
+          return onFail(err);
+        }
+        // Do NOT resolve on ready frame: continue waiting for live terminal output confirming OpenCode UI is active
+        return;
       }
 
       if (
-        msg.type === "ready" ||
-        (msg.type === "status" && (msg.status === "RUNNING" || msg.status === "IDLE")) ||
         msg.type === "output" ||
         msg.type === "chunk" ||
         msg.type === "transcript"
       ) {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timeout);
-          try {
-            if (msg.type === "ready" && typeof ws.send === "function") {
-              ws.send(JSON.stringify({ type: "input", data: "\n" }));
-            }
-          } catch {}
-          try { ws.close(); } catch {}
-          return resolve({ ok: true, frameType: msg.type });
+        const outputData = typeof msg.data === "string" ? msg.data : (typeof msg.text === "string" ? msg.text : "");
+        if (outputData.trim().length > 0) {
+          terminalOutputReceived = true;
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            try { ws.close(); } catch {}
+            return resolve({ ok: true, frameType: msg.type, output: outputData });
+          }
         }
       }
     };
@@ -324,16 +359,20 @@ async function verifyCliWebSocketTransport(wsUrl, cookie, timeoutMs = 10000) {
       ws.on("message", (data) => handleFrame(data));
       ws.on("error", (err) => onFail(err));
       ws.on("close", (code, reason) => {
-        if (!settled && code !== 1000) {
-          onFail(new Error(`WebSocket closed unexpectedly (code: ${code}, reason: ${reason || "none"})`));
+        if (!settled) {
+          if (!terminalOutputReceived) {
+            onFail(new Error(`WebSocket closed before receiving non-empty terminal output (code: ${code}, reason: ${reason || "none"})`));
+          }
         }
       });
     } else {
       ws.onmessage = (event) => handleFrame(event.data);
       ws.onerror = (event) => onFail(new Error(event?.message || "WebSocket connection error"));
       ws.onclose = (event) => {
-        if (!settled && event.code !== 1000) {
-          onFail(new Error(`WebSocket closed unexpectedly (code: ${event.code}, reason: ${event.reason || "none"})`));
+        if (!settled) {
+          if (!terminalOutputReceived) {
+            onFail(new Error(`WebSocket closed before receiving non-empty terminal output (code: ${event.code}, reason: ${event.reason || "none"})`));
+          }
         }
       };
     }

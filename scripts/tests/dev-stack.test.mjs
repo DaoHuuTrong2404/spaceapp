@@ -474,5 +474,51 @@ test("dev-stack atomically acquires dev-stack.lock with flag wx and holds it thr
   assert.match(devStackSource, /postKillDeadline/);
 });
 
+/**
+ * Verifies that dev-stack environment config isolates SPACE_TELEGRAM_OWNERSHIP_MANIFEST
+ * and SPACE_CODEX_HOME within stateRoot/var to prevent writes to /opt/spaceapp or /var/lib.
+ */
+test("dev-stack environment config isolates SPACE_TELEGRAM_OWNERSHIP_MANIFEST and SPACE_CODEX_HOME within stateRoot", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /SPACE_TELEGRAM_OWNERSHIP_MANIFEST:\s*path\.join\(config\.varDir/);
+  assert.match(devStackSource, /SPACE_CODEX_HOME:\s*path\.join\(config\.varDir/);
+  assert.match(devStackSource, /mkdirSync\(path\.dirname\(envCommon\.SPACE_TELEGRAM_OWNERSHIP_MANIFEST\)/);
+  assert.match(devStackSource, /mkdirSync\(envCommon\.SPACE_CODEX_HOME/);
+});
+
+/**
+ * Verifies that startDevStack acquires the atomic state lock before initializing state or child processes,
+ * and guards rollback in catch block using ownsLifecycle so contenders never kill the owner stack.
+ */
+test("startDevStack acquires dev-stack.lock before child processes and guards rollback with ownsLifecycle", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  const startIndex = devStackSource.indexOf("export async function startDevStack");
+  const ownsLifecycleDecl = devStackSource.indexOf("let ownsLifecycle = false", startIndex);
+  const lockAcquire = devStackSource.indexOf("writeFileSync(lockFile, lockPayload, { flag: \"wx\"", startIndex);
+  const ownsLifecycleSet = devStackSource.indexOf("ownsLifecycle = true", lockAcquire);
+  const spawnCliHost = devStackSource.indexOf("Spawning CLI Host", ownsLifecycleSet);
+  const catchRollback = devStackSource.indexOf("if (!ownsLifecycle)", startIndex);
+
+  assert.ok(startIndex > -1);
+  assert.ok(ownsLifecycleDecl > -1, "ownsLifecycle must be initialized before lock acquisition");
+  assert.ok(lockAcquire > -1, "lock acquisition must occur early");
+  assert.ok(ownsLifecycleSet > -1, "ownsLifecycle must be set true only after lock acquisition");
+  assert.ok(spawnCliHost > ownsLifecycleSet, "Child process spawning must occur after lock acquisition");
+  assert.ok(catchRollback > -1, "Catch block must guard rollback with if (!ownsLifecycle)");
+});
+
+/**
+ * Verifies that ci-dev-stack-gate strictly requires live non-empty terminal output,
+ * validates opencode runtime/session identity, and fails on error frames, fatal status, or early close.
+ */
+test("ci-dev-stack-gate strictly requires live non-empty terminal output and fails on premature close or error frames", () => {
+  const gateSource = fs.readFileSync(path.join(process.cwd(), "scripts", "ci-dev-stack-gate.mjs"), "utf8");
+  assert.match(gateSource, /expectedRuntimeId:\s*["']cli:opencode["']/);
+  assert.match(gateSource, /Terminal websocket reported fatal session status/);
+  assert.match(gateSource, /outputData\.trim\(\)\.length > 0/);
+  assert.match(gateSource, /WebSocket closed before receiving non-empty terminal output/);
+  assert.match(gateSource, /Do NOT resolve on ready frame/);
+});
+
 
 
