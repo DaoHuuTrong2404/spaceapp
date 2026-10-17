@@ -4,11 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  assertSafeStateDir,
   ensureSecrets,
   generateDevComposeYaml,
+  isComposeServiceHealthy,
   parsePinnedImages,
   parsePinnedOpencodeVersion,
   resolveDevStackConfig,
+  setupOpencodeWrapper,
   validatePort
 } from "../dev-stack.mjs";
 
@@ -214,3 +217,115 @@ test("ci-dev-stack-gate asserts absence of Compose containers, volumes, and chil
   assert.match(gateSource, /process\.kill\(pid,\s*0\)/);
   assert.match(gateSource, /stopDevStack\(config,\s*\{\s*purge:\s*true\s*\}\)/);
 });
+
+/**
+ * Verifies that isComposeServiceHealthy strictly accepts only healthy states,
+ * refusing substring false-positives such as 'unhealthy'.
+ */
+test("isComposeServiceHealthy strictly distinguishes healthy from unhealthy and starting states", () => {
+  assert.equal(isComposeServiceHealthy({ Health: "healthy" }), true);
+  assert.equal(isComposeServiceHealthy({ Health: "HEALTHY" }), true);
+  assert.equal(isComposeServiceHealthy({ Status: "Up 10 seconds (healthy)" }), true);
+
+  // Failure cases: unhealthy must NEVER be considered healthy
+  assert.equal(isComposeServiceHealthy({ Health: "unhealthy" }), false);
+  assert.equal(isComposeServiceHealthy({ Health: "UNHEALTHY" }), false);
+  assert.equal(isComposeServiceHealthy({ Status: "Up 10 seconds (unhealthy)" }), false);
+  assert.equal(isComposeServiceHealthy({ Health: "starting" }), false);
+  assert.equal(isComposeServiceHealthy({ Status: "Up 10 seconds (health: starting)" }), false);
+  assert.equal(isComposeServiceHealthy(null), false);
+  assert.equal(isComposeServiceHealthy({}), false);
+});
+
+/**
+ * Verifies that assertSafeStateDir protects critical directories from accidental deletion.
+ */
+test("assertSafeStateDir prevents accidental deletion of root, home, or repo directory", () => {
+  const repoRoot = process.cwd();
+  const homeDir = os.homedir();
+  const rootDir = path.parse(repoRoot).root;
+
+  assert.throws(() => assertSafeStateDir(".", repoRoot), /Refusing to delete unsafe state directory/);
+  assert.throws(() => assertSafeStateDir(repoRoot, repoRoot), /Refusing to delete unsafe state directory/);
+  assert.throws(() => assertSafeStateDir(homeDir, repoRoot), /Refusing to delete unsafe state directory/);
+  assert.throws(() => assertSafeStateDir(rootDir, repoRoot), /Refusing to delete unsafe state directory/);
+
+  // Safe directories must not throw
+  const tmpDir = path.join(os.tmpdir(), "safe-test-dev-stack");
+  assert.doesNotThrow(() => assertSafeStateDir(tmpDir, repoRoot));
+  assert.doesNotThrow(() => assertSafeStateDir(path.join(repoRoot, ".dev-stack"), repoRoot));
+});
+
+/**
+ * Verifies that setupOpencodeWrapper writes wrapper scripts implementing
+ * credential-status, credential-observation, and credential-smoke.
+ */
+test("setupOpencodeWrapper creates wrapper supporting credential lifecycle probes and portable observation hash", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-wrapper-"));
+  try {
+    const config = {
+      opencodeDir: path.join(tmpDir, "opencode"),
+      binDir: path.join(tmpDir, "bin")
+    };
+    fs.mkdirSync(path.join(config.opencodeDir, "node_modules", ".bin"), { recursive: true });
+    const dummyBin = path.join(config.opencodeDir, "node_modules", ".bin", process.platform === "win32" ? "opencode.cmd" : "opencode");
+    fs.writeFileSync(dummyBin, process.platform === "win32" ? "@echo off\necho opencode\n" : "#!/bin/sh\necho opencode\n");
+
+    setupOpencodeWrapper(config, "1.18.4");
+
+    const parityPath = path.join(config.binDir, "opencode-vscode-parity");
+    assert.ok(fs.existsSync(parityPath), "POSIX wrapper script must exist");
+    const content = fs.readFileSync(parityPath, "utf8");
+
+    assert.match(content, /credential-status/);
+    assert.match(content, /credential-observation/);
+    assert.match(content, /credential-smoke/);
+    assert.match(content, /SPACE_OPENCODE_OK/);
+    // Observation hash is precomputed SHA-256 for "opencode:ready"
+    assert.match(content, /OBSERVATION:fe2ff8448863efcad9975084caad51bf142b2e40ae6acab7a5bbe6ee3220bea0/);
+
+    if (process.platform === "win32") {
+      const cmdPath = path.join(config.binDir, "opencode-vscode-parity.cmd");
+      assert.ok(fs.existsSync(cmdPath), "Windows .cmd wrapper script must exist");
+      const cmdContent = fs.readFileSync(cmdPath, "utf8");
+      assert.match(cmdContent, /credential-status/);
+      assert.match(cmdContent, /OBSERVATION:fe2ff8448863efcad9975084caad51bf142b2e40ae6acab7a5bbe6ee3220bea0/);
+      assert.match(cmdContent, /SPACE_OPENCODE_OK/);
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that ensureSecrets preserves claimed state when setup-token is consumed.
+ */
+test("ensureSecrets preserves claimed setup token and reports already claimed state", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-claim-"));
+  try {
+    const config = {
+      secretsDir: path.join(tmpDir, "secrets"),
+      runDir: path.join(tmpDir, "run"),
+      binDir: path.join(tmpDir, "bin"),
+      varDir: path.join(tmpDir, "var"),
+      workspacesDir: path.join(tmpDir, "workspaces"),
+      postgresPort: 54329
+    };
+
+    const initial = ensureSecrets(config);
+    assert.ok(initial.setupToken && initial.setupToken !== "Already claimed");
+    assert.ok(initial.setupTokenPath);
+
+    // Simulate owner claim consumption
+    fs.rmSync(initial.setupTokenPath, { force: true });
+
+    // Subsequent call detects claimed state without regenerating token
+    const afterClaim = ensureSecrets(config);
+    assert.equal(afterClaim.setupToken, "Already claimed");
+    assert.equal(afterClaim.setupTokenPath, null);
+    assert.equal(afterClaim.password, initial.password);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

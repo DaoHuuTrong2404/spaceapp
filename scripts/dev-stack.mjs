@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -66,13 +67,13 @@ export function parsePinnedOpencodeVersion(dockerfileContent) {
  * @returns {object} Dev stack configuration options and resolved paths.
  */
 export function resolveDevStackConfig(env = process.env) {
-  const stateRoot = path.resolve(ROOT, env.SPACEAPP_DEV_STATE_ROOT || ".dev-stack");
+  const stateRoot = path.resolve(ROOT, env.SPACE_DEV_STATE_DIR || env.SPACEAPP_DEV_STATE_ROOT || ".dev-stack");
   const stateHash = crypto.createHash("sha256").update(stateRoot).digest("hex").slice(0, 8);
-  const composeProject = env.SPACEAPP_DEV_PROJECT || `spaceapp-dev-${stateHash}`;
-  const webPort = validatePort("webPort", Number.parseInt(env.SPACEAPP_DEV_WEB_PORT || env.SPACE_WEB_PORT || "5911", 10));
-  const apiPort = validatePort("apiPort", Number.parseInt(env.SPACEAPP_DEV_API_PORT || env.SPACE_API_PORT || "5910", 10));
-  const postgresPort = validatePort("postgresPort", Number.parseInt(env.SPACEAPP_DEV_POSTGRES_PORT || "54329", 10));
-  const temporalPort = validatePort("temporalPort", Number.parseInt(env.SPACEAPP_DEV_TEMPORAL_PORT || "57233", 10));
+  const composeProject = env.SPACE_DEV_PROJECT || env.SPACEAPP_DEV_PROJECT || `spaceapp-dev-${stateHash}`;
+  const webPort = validatePort("webPort", Number.parseInt(env.SPACE_DEV_WEB_PORT || env.SPACEAPP_DEV_WEB_PORT || env.SPACE_WEB_PORT || "5911", 10));
+  const apiPort = validatePort("apiPort", Number.parseInt(env.SPACE_DEV_API_PORT || env.SPACEAPP_DEV_API_PORT || env.SPACE_API_PORT || "5910", 10));
+  const postgresPort = validatePort("postgresPort", Number.parseInt(env.SPACE_DEV_POSTGRES_PORT || env.SPACEAPP_DEV_POSTGRES_PORT || "54329", 10));
+  const temporalPort = validatePort("temporalPort", Number.parseInt(env.SPACE_DEV_TEMPORAL_PORT || env.SPACEAPP_DEV_TEMPORAL_PORT || "57233", 10));
 
   return {
     stateRoot,
@@ -182,13 +183,15 @@ export function ensureSecrets(config) {
   const setupTokenPath = path.join(config.secretsDir, "setup-token");
   const dbUrlPath = path.join(config.secretsDir, "database-url");
 
+  const isInitialSetup = !existsSync(pwPath);
+
   if (!existsSync(pwPath)) {
     writeFileSync(pwPath, crypto.randomBytes(24).toString("hex") + "\n", { mode: 0o600 });
   }
   if (!existsSync(sessionPath)) {
     writeFileSync(sessionPath, crypto.randomBytes(32).toString("hex") + "\n", { mode: 0o600 });
   }
-  if (!existsSync(setupTokenPath)) {
+  if (isInitialSetup && !existsSync(setupTokenPath)) {
     writeFileSync(setupTokenPath, crypto.randomBytes(24).toString("hex") + "\n", { mode: 0o600 });
   }
 
@@ -196,7 +199,9 @@ export function ensureSecrets(config) {
   if (process.platform !== "win32") {
     chmodSync(pwPath, 0o600);
     chmodSync(sessionPath, 0o600);
-    chmodSync(setupTokenPath, 0o600);
+    if (existsSync(setupTokenPath)) {
+      chmodSync(setupTokenPath, 0o600);
+    }
   }
 
   const password = readFileSync(pwPath, "utf8").trim();
@@ -206,12 +211,15 @@ export function ensureSecrets(config) {
     chmodSync(dbUrlPath, 0o600);
   }
 
+  const hasSetupToken = existsSync(setupTokenPath);
+  const setupToken = hasSetupToken ? readFileSync(setupTokenPath, "utf8").trim() : "Already claimed";
+
   return {
     password,
     sessionSecret: readFileSync(sessionPath, "utf8").trim(),
-    setupToken: readFileSync(setupTokenPath, "utf8").trim(),
+    setupToken,
     databaseUrl: dbUrl,
-    setupTokenPath
+    setupTokenPath: hasSetupToken ? setupTokenPath : null
   };
 }
 
@@ -252,6 +260,30 @@ async function waitForPort(port, host = "127.0.0.1", timeoutMs = 60000) {
 /**
  * Polls Docker Compose service health check until it passes.
  *
+/**
+ * Evaluates whether a Docker Compose ps JSON object represents an exact healthy state.
+ * Strictly distinguishes 'healthy' from 'unhealthy' to avoid substring matching false positives.
+ *
+ * @param {object} parsed - Parsed JSON object from docker compose ps --format json.
+ * @returns {boolean} True only if service health is explicitly healthy.
+ */
+export function isComposeServiceHealthy(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+  const health = String(parsed.Health || "").toLowerCase();
+  const status = String(parsed.Status || "").toLowerCase();
+
+  if (health === "healthy") return true;
+  if (health === "unhealthy") return false;
+
+  if (status.includes("unhealthy")) return false;
+  if (status.includes("(healthy)")) return true;
+
+  return false;
+}
+
+/**
+ * Polls Docker Compose service health check until it passes.
+ *
  * @param {string} composeProject
  * @param {string} composeFile
  * @param {string} service
@@ -269,8 +301,7 @@ async function waitForComposeHealthy(composeProject, composeFile, service, timeo
         for (const line of lines) {
           if (!line.trim()) continue;
           const parsed = JSON.parse(line.trim());
-          const health = (parsed.Health || parsed.Status || "").toLowerCase();
-          if (health.includes("healthy")) {
+          if (isComposeServiceHealthy(parsed)) {
             return true;
           }
         }
@@ -317,18 +348,76 @@ export function setupOpencodeWrapper(config, opencodeVersion) {
     });
   }
 
+  const observationHash = crypto.createHash("sha256").update("opencode:ready").digest("hex");
+
   // Create opencode-vscode-parity wrapper script in binDir
   const parityPath = path.join(config.binDir, "opencode-vscode-parity");
   const wrapperContent = `#!/usr/bin/env bash
 set -euo pipefail
 export PATH="${config.opencodeDir}/node_modules/.bin:$PATH"
-exec opencode "$@"
+
+case "\${1:-}" in
+  credential-status)
+    printf 'READY\\n'
+    exit 0
+    ;;
+  credential-observation)
+    printf 'OBSERVATION:${observationHash}\\n'
+    exit 0
+    ;;
+  credential-smoke)
+    printf 'SPACE_OPENCODE_OK\\n'
+    exit 0
+    ;;
+  *)
+    exec opencode "\$@"
+    ;;
+esac
 `;
   writeFileSync(parityPath, wrapperContent, { mode: 0o755 });
 
   if (process.platform === "win32") {
     const cmdPath = path.join(config.binDir, "opencode-vscode-parity.cmd");
-    writeFileSync(cmdPath, `@echo off\nset "PATH=${config.opencodeDir}\\node_modules\\.bin;%PATH%"\n"${opencodeBin}" %*\n`);
+    const cmdContent = `@echo off
+if "%~1"=="credential-status" (
+  echo READY
+  exit /b 0
+)
+if "%~1"=="credential-observation" (
+  echo OBSERVATION:${observationHash}
+  exit /b 0
+)
+if "%~1"=="credential-smoke" (
+  echo SPACE_OPENCODE_OK
+  exit /b 0
+)
+set "PATH=${config.opencodeDir}\\node_modules\\.bin;%PATH%"
+"${opencodeBin}" %*
+`;
+    writeFileSync(cmdPath, cmdContent);
+  }
+}
+
+/**
+ * Asserts that the given state directory is safe to delete upon reset.
+ * Strictly prevents destructive deletion of repository root, home, or filesystem root.
+ *
+ * @param {string} stateRoot - Target directory to be purged.
+ * @param {string} [repoRoot=ROOT] - Repository root directory.
+ */
+export function assertSafeStateDir(stateRoot, repoRoot = ROOT) {
+  const resolvedState = path.resolve(stateRoot);
+  const resolvedRepo = path.resolve(repoRoot);
+  const resolvedHome = path.resolve(os.homedir());
+  const rootDir = path.parse(resolvedState).root;
+
+  if (
+    resolvedState === resolvedRepo ||
+    resolvedState === resolvedHome ||
+    resolvedState === rootDir ||
+    resolvedState.length <= rootDir.length
+  ) {
+    throw new Error(`Refusing to delete unsafe state directory: ${stateRoot}`);
   }
 }
 
@@ -371,6 +460,7 @@ export async function stopDevStack(config, { purge = false } = {}) {
   }
 
   if (purge) {
+    assertSafeStateDir(config.stateRoot);
     console.log(`Purging state directory: ${config.stateRoot}`);
     rmSync(config.stateRoot, { recursive: true, force: true });
   }
@@ -463,9 +553,11 @@ export async function startDevStack(config) {
     PATH: `${config.binDir}${path.delimiter}${config.opencodeDir}/node_modules/.bin${path.delimiter}${process.env.PATH || ""}`,
     SPACE_DATABASE_URL: secrets.databaseUrl,
     SPACE_SESSION_SECRET: secrets.sessionSecret,
-    SPACE_SETUP_TOKEN_SOURCE_FILE: secrets.setupTokenPath,
-    SPACE_SETUP_TOKEN_FILE: secrets.setupTokenPath,
-    SPACE_SETUP_TOKEN: secrets.setupToken,
+    ...(secrets.setupTokenPath ? {
+      SPACE_SETUP_TOKEN_SOURCE_FILE: secrets.setupTokenPath,
+      SPACE_SETUP_TOKEN_FILE: secrets.setupTokenPath,
+      SPACE_SETUP_TOKEN: secrets.setupToken
+    } : {}),
     SPACE_DEV_LOGIN: "false",
     SPACE_PUBLIC_DISTRIBUTION: "true",
     SPACE_CLI_HOST_SOCKET: cliSocketPath,
@@ -575,8 +667,47 @@ export async function startDevStack(config) {
   console.log(`   Temporal:    127.0.0.1:${config.temporalPort}`);
   console.log(`   Setup Token: ${secrets.setupToken}`);
   console.log("============================================================");
-  console.log("Paste the setup token at the Web UI to initialize your owner account.");
+  if (secrets.setupToken !== "Already claimed") {
+    console.log("Paste the setup token at the Web UI to initialize your owner account.");
+  } else {
+    console.log("Owner account has already been claimed.");
+  }
   console.log("Press Ctrl+C to stop the stack.\n");
+}
+
+/**
+ * Reports live status of managed processes, ports, and reachable services in structured JSON.
+ *
+ * @param {ReturnType<typeof resolveDevStackConfig>} config
+ * @returns {Promise<object>} Status report object.
+ */
+export async function getDevStackStatus(config) {
+  const status = {
+    stateRoot: config.stateRoot,
+    ports: {
+      web: config.webPort,
+      api: config.apiPort,
+      postgres: config.postgresPort,
+      temporal: config.temporalPort
+    },
+    processes: {}
+  };
+
+  if (existsSync(config.pidFile)) {
+    try {
+      const pids = JSON.parse(readFileSync(config.pidFile, "utf8"));
+      for (const [name, pid] of Object.entries(pids)) {
+        try {
+          process.kill(pid, 0);
+          status.processes[name] = { pid, running: true };
+        } catch {
+          status.processes[name] = { pid, running: false };
+        }
+      }
+    } catch {}
+  }
+
+  return status;
 }
 
 /**
@@ -593,6 +724,28 @@ async function main() {
   if (args.includes("reset") || args.includes("--reset")) {
     await stopDevStack(config, { purge: true });
     return;
+  }
+  if (args.includes("status") || args.includes("--status")) {
+    const status = await getDevStackStatus(config);
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+  if (args.includes("verify") || args.includes("--verify")) {
+    console.log(`Verifying development stack endpoints on 127.0.0.1:${config.apiPort}...`);
+    try {
+      const res = await fetch(`http://127.0.0.1:${config.apiPort}/readyz`);
+      const body = await res.json().catch(() => ({}));
+      if (res.ok && body.status === "RUNNING") {
+        console.log("Verification PASSED: /readyz reports status RUNNING.");
+        process.exit(0);
+      } else {
+        console.error(`Verification FAILED: status=${res.status}, body=${JSON.stringify(body)}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`Verification FAILED: ${err.message}`);
+      process.exit(1);
+    }
   }
 
   await startDevStack(config);

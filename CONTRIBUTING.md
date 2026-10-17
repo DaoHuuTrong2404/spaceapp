@@ -85,8 +85,16 @@ This single command:
 | **PostgreSQL** | `127.0.0.1:54329` | Isolated pgvector database |
 | **Temporal UI / gRPC** | `127.0.0.1:57233` | Temporal workflow engine |
 
-### Stopping and resetting the stack
+### Stopping, inspecting, and resetting the stack
 
+- **Check status**:
+  ```sh
+  npm run dev:stack -- status
+  ```
+- **Verify health endpoints**:
+  ```sh
+  npm run dev:stack -- verify
+  ```
 - **Stop stack (preserves database state)**:
   Press `Ctrl+C` in the terminal where `dev:stack` is running, or execute:
   ```sh
@@ -96,6 +104,18 @@ This single command:
   ```sh
   npm run dev:stack -- reset
   ```
+
+### Configuration & Environment Overrides
+
+The development stack runs isolated defaults out of the box, but can be customized with environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SPACE_DEV_WEB_PORT` | `5911` | Host port bound to Vite Web UI |
+| `SPACE_DEV_API_PORT` | `5910` | Host port bound to Fastify API server |
+| `SPACE_DEV_POSTGRES_PORT` | `54329` | Host loopback port for PostgreSQL |
+| `SPACE_DEV_TEMPORAL_PORT` | `57233` | Host loopback port for Temporal gRPC |
+| `SPACE_DEV_STATE_DIR` | `.dev-stack` | Root directory for isolated secrets, logs, and runtimes |
 
 ### Watching monorepo packages
 
