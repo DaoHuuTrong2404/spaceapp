@@ -449,23 +449,30 @@ test("stopDevStack runs assertSafeStateDir before terminating processes or teari
 });
 
 /**
- * Verifies that ci-dev-stack-gate checks strict session criteria (runtimeId, isActive, non-exited status, websocket token).
+ * Verifies that ci-dev-stack-gate checks strict session criteria, connects via Vite proxy,
+ * sends session cookie, and validates websocket transport frames without error swallowing.
  */
-test("ci-dev-stack-gate enforces runtimeId, isActive, non-exited status, and websocket transport", () => {
+test("ci-dev-stack-gate enforces session criteria, Vite proxy, Cookie header, and strict frame verification", () => {
   const gateSource = fs.readFileSync(path.join(process.cwd(), "scripts", "ci-dev-stack-gate.mjs"), "utf8");
   assert.match(gateSource, /runtimeId === ["']cli:opencode["']/);
   assert.match(gateSource, /isActive === true/);
   assert.match(gateSource, /status !== ["']EXITED["']/);
   assert.match(gateSource, /verifyCliWebSocketTransport/);
+  assert.match(gateSource, /webPort/);
+  assert.match(gateSource, /Cookie:\s*cookie/);
+  assert.match(gateSource, /Terminal websocket reported error frame/);
 });
 
 /**
- * Verifies that dev-stack inspects and writes dev-stack.lock to prevent concurrent executions.
+ * Verifies that dev-stack atomically acquires dev-stack.lock with flag 'wx' and holds it through teardown.
  */
-test("dev-stack inspects and writes dev-stack.lock to prevent duplicate concurrent runs", () => {
+test("dev-stack atomically acquires dev-stack.lock with flag wx and holds it through teardown", () => {
   const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /flag:\s*["']wx["']/);
   assert.match(devStackSource, /dev-stack\.lock/);
   assert.match(devStackSource, /Refusing to start duplicate stack/);
+  assert.match(devStackSource, /postKillDeadline/);
 });
+
 
 

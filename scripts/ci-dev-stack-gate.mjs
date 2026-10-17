@@ -215,81 +215,128 @@ async function verifyStarterRoomAndCliPane(cookie) {
   const status = activeSession.status || "RUNNING";
   console.log(`CLI session verified in API state (id: ${sessionId}, runtime: ${activeSession.runtimeId}, status: ${status}).`);
 
-  // Verify real WebSocket transport and terminal output handshake if ticket is present
+  // Verify real WebSocket transport and terminal output handshake through Vite proxy
   const wsToken = lastSessionData.websocket?.token;
-  if (wsToken) {
-    const wsOrigin = API_ORIGIN.replace(/^http/, "ws");
-    const wsUrl = `${wsOrigin}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(wsToken)}`;
-    console.log("Connecting to CLI terminal WebSocket to verify live transport and output frames...");
-    try {
-      const frame = await verifyCliWebSocketTransport(wsUrl);
-      console.log("Live WebSocket terminal transport verified:", frame.type || "frame received");
-    } catch (wsErr) {
-      console.warn("Live WebSocket terminal verification warning:", wsErr.message);
-    }
+  if (!wsToken) {
+    throw new Error("CLI session response is missing required websocket token/ticket.");
   }
+
+  // Connect through Vite proxy on webPort to verify Vite proxy and CLI terminal transport
+  const webOrigin = `http://127.0.0.1:${config.webPort}`;
+  const wsOrigin = webOrigin.replace(/^http/, "ws");
+  const wsUrl = `${wsOrigin}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(wsToken)}`;
+  console.log(`Connecting to CLI terminal WebSocket via Vite proxy at ${wsUrl}...`);
+
+  // MUST NOT catch or swallow: must strictly fail the gate on error, timeout, or bad frames
+  const wsResult = await verifyCliWebSocketTransport(wsUrl, cookie);
+  console.log("Live WebSocket terminal transport verified via Vite proxy:", wsResult);
 }
 
 /**
  * Connects to the CLI terminal WebSocket endpoint and asserts receipt of
- * at least one valid protocol frame (ready, status, or terminal output).
+ * valid protocol handshake/output frames. Rejects on error frame, non-JSON text,
+ * connection error, or timeout.
  *
  * @param {string} wsUrl - WebSocket URL with sessionId and token.
- * @param {number} [timeoutMs=8000] - Timeout in milliseconds.
- * @returns {Promise<object>} Parsed frame or raw message received.
+ * @param {string|null} [cookie] - Session cookie for authenticated connection.
+ * @param {number} [timeoutMs=10000] - Timeout in milliseconds.
+ * @returns {Promise<object>} Parsed valid frame received.
  */
-async function verifyCliWebSocketTransport(wsUrl, timeoutMs = 8000) {
-  if (typeof WebSocket === "undefined") {
-    console.log("WebSocket global is not available; skipping socket wire test.");
-    return { skipped: true };
+async function verifyCliWebSocketTransport(wsUrl, cookie, timeoutMs = 10000) {
+  let WebSocketClient = globalThis.WebSocket;
+  try {
+    const wsMod = await import("ws");
+    WebSocketClient = wsMod.default || wsMod;
+  } catch {}
+
+  if (!WebSocketClient) {
+    throw new Error("No WebSocket client implementation available.");
   }
+
   return new Promise((resolve, reject) => {
     let settled = false;
     let ws = null;
+
     const timeout = setTimeout(() => {
       if (!settled) {
         settled = true;
         try { ws?.close(); } catch {}
-        reject(new Error("Timeout waiting for WebSocket ready/output frame from CLI host"));
+        reject(new Error(`Timeout (${timeoutMs}ms) waiting for WebSocket ready/output frame from CLI host`));
       }
     }, timeoutMs);
 
+    const onFail = (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        try { ws?.close(); } catch {}
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+
     try {
-      ws = new WebSocket(wsUrl);
+      ws = new WebSocketClient(wsUrl, {
+        headers: {
+          Cookie: cookie || ""
+        }
+      });
     } catch (err) {
       clearTimeout(timeout);
       return reject(err);
     }
 
-    ws.onmessage = (event) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        try { ws.close(); } catch {}
-        try {
-          const parsed = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
-          resolve(parsed);
-        } catch {
-          resolve({ raw: event.data });
+    const handleFrame = (raw) => {
+      if (settled) return;
+      let msg;
+      try {
+        const text = typeof raw === "string" ? raw : (raw?.data ? raw.data.toString() : raw.toString());
+        msg = JSON.parse(text);
+      } catch {
+        return onFail(new Error(`Received unexpected non-JSON frame on terminal websocket: ${String(raw).slice(0, 150)}`));
+      }
+
+      if (msg.type === "error" || msg.error) {
+        return onFail(new Error(`Terminal websocket reported error frame: ${msg.error || JSON.stringify(msg)}`));
+      }
+
+      if (
+        msg.type === "ready" ||
+        (msg.type === "status" && (msg.status === "RUNNING" || msg.status === "IDLE")) ||
+        msg.type === "output" ||
+        msg.type === "chunk" ||
+        msg.type === "transcript"
+      ) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timeout);
+          try {
+            if (msg.type === "ready" && typeof ws.send === "function") {
+              ws.send(JSON.stringify({ type: "input", data: "\n" }));
+            }
+          } catch {}
+          try { ws.close(); } catch {}
+          return resolve({ ok: true, frameType: msg.type });
         }
       }
     };
 
-    ws.onerror = (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        reject(err instanceof Error ? err : new Error(`WebSocket error: ${err.message || String(err)}`));
-      }
-    };
-
-    ws.onclose = (event) => {
-      if (!settled && event.code !== 1000) {
-        settled = true;
-        clearTimeout(timeout);
-        reject(new Error(`WebSocket closed unexpectedly (code: ${event.code}, reason: ${event.reason || "none"})`));
-      }
-    };
+    if (typeof ws.on === "function") {
+      ws.on("message", (data) => handleFrame(data));
+      ws.on("error", (err) => onFail(err));
+      ws.on("close", (code, reason) => {
+        if (!settled && code !== 1000) {
+          onFail(new Error(`WebSocket closed unexpectedly (code: ${code}, reason: ${reason || "none"})`));
+        }
+      });
+    } else {
+      ws.onmessage = (event) => handleFrame(event.data);
+      ws.onerror = (event) => onFail(new Error(event?.message || "WebSocket connection error"));
+      ws.onclose = (event) => {
+        if (!settled && event.code !== 1000) {
+          onFail(new Error(`WebSocket closed unexpectedly (code: ${event.code}, reason: ${event.reason || "none"})`));
+        }
+      };
+    }
   });
 }
 

@@ -610,7 +610,7 @@ export async function stopDevStack(config, { purge = false } = {}) {
       // Ignore pidfile read errors
     }
 
-    // Wait up to 5s for child processes to exit cleanly
+    // 1. Initial wait for SIGTERM: up to 5s deadline
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
       const alive = recordedPids.filter((pid) => {
@@ -625,16 +625,8 @@ export async function stopDevStack(config, { purge = false } = {}) {
       await new Promise((r) => setTimeout(r, 200));
     }
 
-    // Escalate to SIGKILL if any still alive
-    if (process.platform !== "win32") {
-      for (const pid of recordedPids) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch {}
-      }
-    }
-
-    const stillAlive = recordedPids.filter((pid) => {
+    // 2. Identify only lingering PIDs that are actually still alive
+    const lingeringPids = recordedPids.filter((pid) => {
       try {
         process.kill(pid, 0);
         return true;
@@ -642,21 +634,52 @@ export async function stopDevStack(config, { purge = false } = {}) {
         return false;
       }
     });
-    if (stillAlive.length > 0 && purge) {
-      throw new Error(`Failed to terminate child processes (${stillAlive.join(", ")}). Aborting state purge.`);
+
+    // 3. Escalate to SIGKILL / taskkill only on lingering PIDs
+    if (lingeringPids.length > 0) {
+      for (const pid of lingeringPids) {
+        try {
+          if (process.platform === "win32") {
+            spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+          } else {
+            process.kill(pid, "SIGKILL");
+          }
+        } catch {}
+      }
+
+      // 4. Wait for OS kernel to reclaim processes after escalation (up to 3s deadline)
+      const postKillDeadline = Date.now() + 3000;
+      while (Date.now() < postKillDeadline) {
+        const stillLingering = lingeringPids.filter((pid) => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        });
+        if (stillLingering.length === 0) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+
+    // 5. Final check: if any lingering PID is STILL alive after escalation + deadline
+    const unkillable = lingeringPids.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (unkillable.length > 0 && purge) {
+      throw new Error(`Failed to terminate child processes (${unkillable.join(", ")}). Aborting state purge.`);
     }
 
     rmSync(config.pidFile, { force: true });
   }
 
-  // Release state lock if present
-  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
-  if (existsSync(lockFile)) {
-    try {
-      rmSync(lockFile, { force: true });
-    } catch {}
-  }
-
+  // Teardown Docker Compose services while holding state lock
   if (existsSync(composeFile)) {
     const args = ["compose", "-p", config.composeProject, "-f", composeFile];
     if (purge) {
@@ -668,6 +691,28 @@ export async function stopDevStack(config, { purge = false } = {}) {
     if (purge && res.status !== 0) {
       throw new Error(`Failed to tear down Docker Compose services (exit code ${res.status}). Aborting state purge to prevent data loss.`);
     }
+  }
+
+  // Release state lock ONLY AFTER Docker teardown is completely finished, and only by owner unless purging
+  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+  if (existsSync(lockFile)) {
+    try {
+      if (purge) {
+        rmSync(lockFile, { force: true });
+      } else {
+        const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
+        if (lockData?.pid === process.pid) {
+          rmSync(lockFile, { force: true });
+        } else if (typeof lockData?.pid === "number") {
+          try {
+            process.kill(lockData.pid, 0);
+          } catch {
+            // Process dead
+            rmSync(lockFile, { force: true });
+          }
+        }
+      }
+    } catch {}
   }
 
   if (purge) {
@@ -693,26 +738,6 @@ export async function startDevStack(config) {
 
   // Validate stateRoot early
   assertSafeStateDir(config.stateRoot, ROOT);
-
-  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
-  if (existsSync(lockFile)) {
-    try {
-      const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
-      if (lockData.pid && typeof lockData.pid === "number") {
-        let isAlive = false;
-        try {
-          process.kill(lockData.pid, 0);
-          isAlive = true;
-        } catch {}
-        if (isAlive) {
-          throw new Error(`Dev stack is already running in state directory ${config.stateRoot} (PID: ${lockData.pid}). Refusing to start duplicate stack.`);
-        }
-      }
-    } catch (e) {
-      if (e.message && e.message.includes("already running")) throw e;
-      // Stale or unreadable lock file can be superseded
-    }
-  }
 
   const children = new Map();
   let stopping = false;
@@ -748,12 +773,45 @@ export async function startDevStack(config) {
 
     const secrets = ensureSecrets(config);
 
-    // Acquire state lock now that secrets/marker are validated
-    writeFileSync(
-      lockFile,
-      JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n",
-      { mode: 0o600 }
-    );
+    // Atomically acquire state lock using flag: 'wx' (O_CREAT | O_EXCL)
+    const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+    const lockPayload = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n";
+    let lockAcquired = false;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        writeFileSync(lockFile, lockPayload, { flag: "wx", mode: 0o600 });
+        lockAcquired = true;
+        break;
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+
+        // Lock file exists: check if recording PID is alive
+        try {
+          const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
+          if (lockData.pid && typeof lockData.pid === "number") {
+            let isAlive = false;
+            try {
+              process.kill(lockData.pid, 0);
+              isAlive = true;
+            } catch {}
+            if (isAlive) {
+              throw new Error(`Dev stack is already running in state directory ${config.stateRoot} (PID: ${lockData.pid}). Refusing to start duplicate stack.`);
+            }
+          }
+          // Stale lock: remove and retry once
+          rmSync(lockFile, { force: true });
+        } catch (readErr) {
+          if (readErr.message && readErr.message.includes("already running")) throw readErr;
+          // Corrupted lock file: remove and retry once
+          rmSync(lockFile, { force: true });
+        }
+      }
+    }
+
+    if (!lockAcquired) {
+      throw new Error(`Failed to acquire atomic state lock for directory ${config.stateRoot}`);
+    }
   const composeYaml = generateDevComposeYaml({
     postgresImage: images.postgres,
     temporalImage: images.temporal,
