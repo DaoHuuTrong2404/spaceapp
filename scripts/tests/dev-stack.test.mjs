@@ -13,6 +13,7 @@ import {
   resolveCliHostSocketPath,
   resolveDevStackConfig,
   setupOpencodeWrapper,
+  startDevStack,
   validatePort
 } from "../dev-stack.mjs";
 
@@ -520,5 +521,101 @@ test("ci-dev-stack-gate strictly requires live non-empty terminal output and fai
   assert.match(gateSource, /Do NOT resolve on ready frame/);
 });
 
+/**
+ * Verifies that on fresh startup, after acquiring dev-stack.lock,
+ * ensureSecrets recognizes the lock belonging to the current process, initializes
+ * the state marker, and generates all required secrets without refusing adoption.
+ */
+test("fresh startup interaction: acquires lock and initializes state marker and secrets", () => {
+  const tmpFresh = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-fresh-interaction-"));
+  try {
+    const config = {
+      stateRoot: tmpFresh,
+      secretsDir: path.join(tmpFresh, "secrets"),
+      runDir: path.join(tmpFresh, "run"),
+      binDir: path.join(tmpFresh, "bin"),
+      varDir: path.join(tmpFresh, "var"),
+      workspacesDir: path.join(tmpFresh, "workspaces"),
+      postgresPort: 54329
+    };
 
+    // Simulate startDevStack lock acquisition on fresh directory
+    const lockFile = path.join(tmpFresh, "dev-stack.lock");
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), { mode: 0o600 });
 
+    // ensureSecrets must succeed and NOT throw "Refusing to adopt"
+    const secrets = ensureSecrets(config);
+    assert.ok(secrets.password);
+    assert.ok(secrets.sessionSecret);
+    assert.ok(secrets.setupToken);
+
+    // Marker must be created
+    const markerPath = path.join(tmpFresh, ".dev-stack-state.json");
+    assert.ok(fs.existsSync(markerPath));
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+    assert.equal(marker.createdBy, "spaceapp-dev-stack");
+  } finally {
+    fs.rmSync(tmpFresh, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that calling startDevStack with a completely non-existent stateRoot
+ * initializes the state root, acquires the lock, and does not fail on the fresh directory adoption guard.
+ */
+test("startDevStack succeeds in adopting and initializing a non-existent fresh state directory", async () => {
+  const tmpRoot = path.join(os.tmpdir(), "spaceapp-test-start-fresh-" + Date.now());
+  assert.equal(fs.existsSync(tmpRoot), false);
+
+  const config = resolveDevStackConfig({
+    SPACE_DEV_STATE_DIR: tmpRoot,
+    SPACE_DEV_API_PORT: "5919",
+    SPACE_DEV_WEB_PORT: "5918",
+    SPACE_DEV_POSTGRES_PORT: "54339",
+    SPACE_DEV_TEMPORAL_PORT: "57243"
+  });
+
+  try {
+    await startDevStack(config);
+  } catch (err) {
+    // If docker is unavailable in test environment, it will fail at docker compose,
+    // but it MUST NOT fail on the fresh directory adoption guard!
+    assert.doesNotMatch(
+      err.message,
+      /Refusing to adopt non-empty existing directory/,
+      "startDevStack must not fail on the fresh directory adoption guard"
+    );
+  } finally {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+/**
+ * Verifies that startDevStack inspects directory contents before acquisition
+ * and refuses to touch an existing non-empty directory lacking the marker without writing a lock file.
+ */
+test("startDevStack refuses non-empty directory lacking marker without writing lock file", async () => {
+  const tmpForeign = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-foreign-"));
+  try {
+    fs.writeFileSync(path.join(tmpForeign, "unrelated-data.txt"), "important data");
+
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpForeign
+    });
+
+    await assert.rejects(
+      async () => {
+        await startDevStack(config);
+      },
+      /Refusing to adopt non-empty existing directory without \.dev-stack-state\.json marker/
+    );
+
+    // Assert no lock file was written into foreign directory
+    const lockFile = path.join(tmpForeign, "dev-stack.lock");
+    assert.equal(fs.existsSync(lockFile), false, "dev-stack.lock must NOT be created in a foreign directory");
+  } finally {
+    fs.rmSync(tmpForeign, { recursive: true, force: true });
+  }
+});

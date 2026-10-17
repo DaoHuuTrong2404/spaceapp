@@ -224,8 +224,23 @@ export function ensureSecrets(config) {
   } else {
     if (existsSync(stateRoot)) {
       const existingEntries = readdirSync(stateRoot);
-      if (existingEntries.length > 0) {
+      const nonLockEntries = existingEntries.filter((e) => e !== "dev-stack.lock");
+      if (nonLockEntries.length > 0) {
         throw new Error(`Refusing to adopt non-empty existing directory without .dev-stack-state.json marker as state root: ${stateRoot}`);
+      }
+
+      if (existingEntries.includes("dev-stack.lock")) {
+        const lockFile = path.join(stateRoot, "dev-stack.lock");
+        let lockVerified = false;
+        try {
+          const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
+          if (lockData?.pid === process.pid) {
+            lockVerified = true;
+          }
+        } catch {}
+        if (!lockVerified) {
+          throw new Error(`Refusing to adopt non-empty existing directory without .dev-stack-state.json marker as state root: ${stateRoot}`);
+        }
       }
     }
     mkdirSync(stateRoot, { recursive: true });
@@ -740,10 +755,21 @@ export async function startDevStack(config) {
 
   // Validate stateRoot early and ensure base directory exists
   assertSafeStateDir(config.stateRoot, ROOT);
+
+  const markerPath = path.join(config.stateRoot, ".dev-stack-state.json");
+  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+
+  // Inspect directory contents BEFORE acquisition: refuse non-empty directory lacking marker without touching it
+  if (existsSync(config.stateRoot) && !existsSync(markerPath)) {
+    const preEntries = readdirSync(config.stateRoot).filter((e) => e !== "dev-stack.lock");
+    if (preEntries.length > 0) {
+      throw new Error(`Refusing to adopt non-empty existing directory without .dev-stack-state.json marker as state root: ${config.stateRoot}`);
+    }
+  }
+
   mkdirSync(config.stateRoot, { recursive: true, mode: 0o700 });
 
   // Atomically acquire state lock using flag: 'wx' (O_CREAT | O_EXCL) before any state mutation
-  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
   const lockPayload = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n";
   let lockAcquired = false;
 
