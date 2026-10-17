@@ -69,13 +69,12 @@ npm run dev:stack
 ```
 
 This single command:
-1. Validates prerequisites (`node`, `docker`, and docker compose plugin).
-2. Generates an isolated state directory in `.dev-stack/` with secure 0600 credentials.
-3. Automatically pins and starts containerized dependencies (`pgvector/pgvector:pg16` and `temporalio/auto-setup`).
-4. Installs the pinned OpenCode CLI locally in `.dev-stack/opencode` (with VS Code parity) without polluting global `PATH`.
-5. Builds internal monorepo packages (`@space/*`).
-6. Runs database migrations against the isolated development database.
-7. Starts the background Temporal worker, API service, and Vite web development server with hot-module replacement.
+1. Generates an isolated state directory in `.dev-stack/` with secure 0600 credentials.
+2. Automatically extracts and starts containerized dependencies using the pinned image digests from the compose template.
+3. Installs the pinned OpenCode CLI locally in `.dev-stack/opencode` (with VS Code parity) without polluting global `PATH`.
+4. Builds internal monorepo packages (`@space/*`).
+5. Runs database migrations against the isolated development database.
+6. Starts the background Temporal worker, API service, and Vite web development server with hot-module replacement.
 
 ### Development service endpoints
 

@@ -67,7 +67,8 @@ export function parsePinnedOpencodeVersion(dockerfileContent) {
  */
 export function resolveDevStackConfig(env = process.env) {
   const stateRoot = path.resolve(ROOT, env.SPACEAPP_DEV_STATE_ROOT || ".dev-stack");
-  const composeProject = env.SPACEAPP_DEV_PROJECT || "spaceapp-dev";
+  const stateHash = crypto.createHash("sha256").update(stateRoot).digest("hex").slice(0, 8);
+  const composeProject = env.SPACEAPP_DEV_PROJECT || `spaceapp-dev-${stateHash}`;
   const webPort = validatePort("webPort", Number.parseInt(env.SPACEAPP_DEV_WEB_PORT || env.SPACE_WEB_PORT || "5911", 10));
   const apiPort = validatePort("apiPort", Number.parseInt(env.SPACEAPP_DEV_API_PORT || env.SPACE_API_PORT || "5910", 10));
   const postgresPort = validatePort("postgresPort", Number.parseInt(env.SPACEAPP_DEV_POSTGRES_PORT || "54329", 10));
@@ -249,6 +250,38 @@ async function waitForPort(port, host = "127.0.0.1", timeoutMs = 60000) {
 }
 
 /**
+ * Polls Docker Compose service health check until it passes.
+ *
+ * @param {string} composeProject
+ * @param {string} composeFile
+ * @param {string} service
+ * @param {number} [timeoutMs=120000]
+ */
+async function waitForComposeHealthy(composeProject, composeFile, service, timeoutMs = 120000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = spawnSync("docker", ["compose", "-p", composeProject, "-f", composeFile, "ps", service, "--format", "json"], {
+        encoding: "utf8"
+      });
+      if (res.stdout) {
+        const lines = res.stdout.trim().split("\n");
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const parsed = JSON.parse(line.trim());
+          const health = (parsed.Health || parsed.Status || "").toLowerCase();
+          if (health.includes("healthy")) {
+            return true;
+          }
+        }
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`Timed out waiting for ${service} to become healthy in Compose after ${timeoutMs}ms`);
+}
+
+/**
  * Synchronously executes a command and asserts zero exit status.
  *
  * @param {string} command
@@ -378,8 +411,11 @@ export async function startDevStack(config) {
   console.log(`Waiting for PostgreSQL on 127.0.0.1:${config.postgresPort}...`);
   await waitForPort(config.postgresPort, "127.0.0.1", 60000);
 
-  console.log(`Waiting for Temporal on 127.0.0.1:${config.temporalPort}...`);
-  await waitForPort(config.temporalPort, "127.0.0.1", 90000);
+  console.log("Waiting for Temporal service health check to pass...");
+  await waitForComposeHealthy(config.composeProject, composeFile, "temporal", 120000);
+
+  console.log("Compiling workspace packages before migrations...");
+  runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:packages"]);
 
   console.log("Running database migrations...");
   runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "db:migrate"], {
@@ -392,18 +428,15 @@ export async function startDevStack(config) {
   console.log("Setting up local opencode wrapper...");
   setupOpencodeWrapper(config, opencodeVersion);
 
-  // Build required packages if not already built
-  console.log("Ensuring packages are compiled...");
-  runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:packages"], {
-    shell: true
-  });
+  console.log("Compiling worker application...");
+  runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build", "-w", "@space/worker"]);
 
   // Spawn services
   const cliSocketPath = path.join(config.runDir, "cli-host.sock");
   const children = new Map();
   let stopping = false;
 
-  function shutdown(signal = "SIGTERM") {
+  function shutdown(signal = "SIGTERM", exitCode = 0) {
     if (stopping) return;
     stopping = true;
     console.log(`\nStopping dev-stack (${signal})...`);
@@ -413,12 +446,12 @@ export async function startDevStack(config) {
       } catch {}
     }
     stopDevStack(config, { purge: false }).then(() => {
-      process.exit(0);
+      process.exit(exitCode);
     });
   }
 
   for (const sig of ["SIGINT", "SIGTERM"]) {
-    process.once(sig, () => shutdown(sig));
+    process.once(sig, () => shutdown(sig, 0));
   }
 
   const envCommon = {
@@ -505,7 +538,7 @@ export async function startDevStack(config) {
       children.delete(name);
       if (!stopping) {
         console.error(`\n[FATAL] Dev stack process "${name}" exited unexpectedly (code: ${code}, signal: ${signal}).`);
-        shutdown("SIGTERM");
+        shutdown("SIGTERM", 1);
       }
     });
   }

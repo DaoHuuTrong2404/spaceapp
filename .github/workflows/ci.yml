@@ -79,7 +79,7 @@ jobs:
         run: ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci
 
       - name: Build internal packages
-        run: npm run build
+        run: npm run build:packages
 
       - name: Run dev:stack unit tests
         run: node --test scripts/tests/dev-stack.test.mjs

@@ -182,6 +182,8 @@ async function verifyResetCleanup() {
  */
 async function main() {
   let devStackProcess = null;
+  let isShuttingDown = false;
+  let unexpectedExitError = null;
 
   try {
     console.log("Starting dev:stack without a TTY...");
@@ -192,9 +194,17 @@ async function main() {
 
     devStackProcess.on("error", (err) => {
       console.error("Failed to spawn dev-stack process:", err);
+      unexpectedExitError = err;
+    });
+
+    devStackProcess.on("exit", (code, signal) => {
+      if (!isShuttingDown && (code !== 0 || signal)) {
+        unexpectedExitError = new Error(`dev:stack process exited unexpectedly with code ${code ?? signal}`);
+      }
     });
 
     await waitForReadyz(150000);
+    if (unexpectedExitError) throw unexpectedExitError;
 
     // Read setup token
     const tokenFile = path.join(config.secretsDir, "setup-token");
@@ -206,8 +216,10 @@ async function main() {
     const { cookie } = await claimOwner(setupToken);
     await verifyStarterRoomAndCliPane(cookie);
 
+    if (unexpectedExitError) throw unexpectedExitError;
     console.log("All functional gate assertions PASSED!");
   } finally {
+    isShuttingDown = true;
     if (devStackProcess) {
       try {
         devStackProcess.kill("SIGTERM");
@@ -226,6 +238,7 @@ async function main() {
       } catch {}
     }
     await verifyResetCleanup();
+    if (unexpectedExitError) throw unexpectedExitError;
   }
 }
 

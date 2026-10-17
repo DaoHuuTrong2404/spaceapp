@@ -37,6 +37,7 @@ export function startPackageWatcher() {
   console.log(`Watching for changes across packages/*...`);
   let debounceTimeout = null;
   let isBuilding = false;
+  let rebuildPending = false;
 
   const watcher = watch(PACKAGES_DIR, { recursive: true }, (_eventType, filename) => {
     if (!filename) return;
@@ -53,10 +54,16 @@ export function startPackageWatcher() {
 
     if (debounceTimeout) clearTimeout(debounceTimeout);
     debounceTimeout = setTimeout(async () => {
-      if (isBuilding) return;
+      if (isBuilding) {
+        rebuildPending = true;
+        return;
+      }
       isBuilding = true;
       try {
-        await rebuildPackages();
+        do {
+          rebuildPending = false;
+          await rebuildPackages();
+        } while (rebuildPending);
       } finally {
         isBuilding = false;
       }
