@@ -157,10 +157,10 @@ test("ensureSecrets creates required secret files with proper modes and preserve
 /**
  * Verifies that generateDevComposeYaml avoids container_name to prevent global conflicts and defines healthchecks.
  */
-test("generateDevComposeYaml omits fixed container_name and defines healthchecks for postgres and temporal", () => {
+test("generateDevComposeYaml omits fixed container_name, defines healthchecks, and mounts secrets with mode 0444", () => {
   const yaml = generateDevComposeYaml({
-    postgresImage: "pgvector/pgvector:0.8.3",
-    temporalImage: "temporalio/auto-setup:1.29.1",
+    postgresImage: "pgvector/pgvector:0.8.3-pg17-trixie@sha256:3a3147ccd9a0aee952bb69e1acea1eb3cc7183544185b87a662f872cfa47ae3b",
+    temporalImage: "temporalio/auto-setup:1.29.1@sha256:5b3502a3b685f9eff1b925af90c57c9e3dbeccbef367cc28a2a9712c63379312",
     postgresPort: 54329,
     temporalPort: 57233,
     secretsDir: "/path/to/secrets",
@@ -170,6 +170,7 @@ test("generateDevComposeYaml omits fixed container_name and defines healthchecks
   assert.doesNotMatch(yaml, /container_name:/);
   assert.match(yaml, /healthcheck:\s*\n\s*test: \["CMD-SHELL", "pg_isready/);
   assert.match(yaml, /temporal operator cluster health/);
+  assert.match(yaml, /mode: 0444/);
 });
 
 /**
@@ -185,6 +186,7 @@ test("CONTRIBUTING.md documents all required platforms and commands", () => {
   assert.match(contributing, /Colima/);
   assert.match(contributing, /Windows 11/);
   assert.match(contributing, /WSL2/);
+  assert.match(contributing, /Temporal gRPC/);
 });
 
 /**
@@ -217,16 +219,21 @@ test("ci-dev-stack-gate asserts absence of Compose containers, volumes, and chil
   assert.match(gateSource, /volume.*ls.*--filter/);
   assert.match(gateSource, /process\.kill\(pid,\s*0\)/);
   assert.match(gateSource, /stopDevStack\(config,\s*\{\s*purge:\s*true\s*\}\)/);
+  assert.match(gateSource, /verifyResetCleanup\(activePids\)/);
 });
 
 /**
  * Verifies that isComposeServiceHealthy strictly accepts only healthy states,
- * refusing substring false-positives such as 'unhealthy'.
+ * refusing substring false-positives such as 'unhealthy', and supports arrays.
  */
-test("isComposeServiceHealthy strictly distinguishes healthy from unhealthy and starting states", () => {
+test("isComposeServiceHealthy strictly distinguishes healthy from unhealthy and starting states and supports arrays", () => {
   assert.equal(isComposeServiceHealthy({ Health: "healthy" }), true);
   assert.equal(isComposeServiceHealthy({ Health: "HEALTHY" }), true);
   assert.equal(isComposeServiceHealthy({ Status: "Up 10 seconds (healthy)" }), true);
+
+  // Arrays of services
+  assert.equal(isComposeServiceHealthy([{ Health: "healthy" }, { Health: "healthy" }]), true);
+  assert.equal(isComposeServiceHealthy([{ Health: "healthy" }, { Health: "unhealthy" }]), false);
 
   // Failure cases: unhealthy must NEVER be considered healthy
   assert.equal(isComposeServiceHealthy({ Health: "unhealthy" }), false);
@@ -241,20 +248,26 @@ test("isComposeServiceHealthy strictly distinguishes healthy from unhealthy and 
 /**
  * Verifies that assertSafeStateDir protects critical directories from accidental deletion.
  */
-test("assertSafeStateDir prevents accidental deletion of root, home, or repo directory", () => {
+test("assertSafeStateDir prevents accidental deletion of root, home, ancestors, or repo source directory", () => {
   const repoRoot = process.cwd();
   const homeDir = os.homedir();
   const rootDir = path.parse(repoRoot).root;
 
   assert.throws(() => assertSafeStateDir(".", repoRoot), /Refusing to delete unsafe state directory/);
   assert.throws(() => assertSafeStateDir(repoRoot, repoRoot), /Refusing to delete unsafe state directory/);
+  assert.throws(() => assertSafeStateDir("..", repoRoot), /Refusing to delete unsafe state directory/);
   assert.throws(() => assertSafeStateDir(homeDir, repoRoot), /Refusing to delete unsafe state directory/);
   assert.throws(() => assertSafeStateDir(rootDir, repoRoot), /Refusing to delete unsafe state directory/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "apps"), repoRoot), /Refusing to delete protected repository source folder/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "packages"), repoRoot), /Refusing to delete protected repository source folder/);
 
   // Safe directories must not throw
   const tmpDir = path.join(os.tmpdir(), "safe-test-dev-stack");
   assert.doesNotThrow(() => assertSafeStateDir(tmpDir, repoRoot));
   assert.doesNotThrow(() => assertSafeStateDir(path.join(repoRoot, ".dev-stack"), repoRoot));
+
+  // If requireMarker is set, missing marker throws
+  assert.throws(() => assertSafeStateDir(process.cwd(), repoRoot, { requireMarker: true }));
 });
 
 /**
@@ -265,6 +278,7 @@ test("setupOpencodeWrapper creates wrapper supporting credential lifecycle probe
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-wrapper-"));
   try {
     const config = {
+      stateRoot: tmpDir,
       opencodeDir: path.join(tmpDir, "opencode"),
       binDir: path.join(tmpDir, "bin")
     };
@@ -282,6 +296,10 @@ test("setupOpencodeWrapper creates wrapper supporting credential lifecycle probe
     assert.match(content, /credential-observation/);
     assert.match(content, /credential-smoke/);
     assert.match(content, /SPACE_OPENCODE_OK/);
+    assert.match(content, /HOME=/);
+    assert.match(content, /TMPDIR=/);
+    assert.match(content, /XDG_CONFIG_HOME=/);
+    assert.match(content, /XDG_STATE_HOME=/);
     // Observation hash is precomputed SHA-256 for "opencode:ready"
     assert.match(content, /OBSERVATION:fe2ff8448863efcad9975084caad51bf142b2e40ae6acab7a5bbe6ee3220bea0/);
 
@@ -292,6 +310,7 @@ test("setupOpencodeWrapper creates wrapper supporting credential lifecycle probe
       assert.match(cmdContent, /credential-status/);
       assert.match(cmdContent, /OBSERVATION:fe2ff8448863efcad9975084caad51bf142b2e40ae6acab7a5bbe6ee3220bea0/);
       assert.match(cmdContent, /SPACE_OPENCODE_OK/);
+      assert.match(cmdContent, /XDG_CONFIG_HOME=/);
     }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -339,11 +358,11 @@ test("resolveCliHostSocketPath handles default short path, long path tmpdir fall
   const shortPath = resolveCliHostSocketPath(shortRunDir, {});
   assert.equal(shortPath, path.resolve(shortRunDir, "cli-host.sock"));
 
-  // 2. Long path (>96 bytes): falls back to os.tmpdir() with space-cli-<hash>.sock
+  // 2. Long path (>96 bytes): falls back to os.tmpdir() with s-<hash>.sock
   const longRunDir = path.join(os.tmpdir(), "a".repeat(120), "deep", "nested", "run");
   const fallbackPath = resolveCliHostSocketPath(longRunDir, {});
   assert.ok(Buffer.byteLength(fallbackPath) < 100, `Fallback path ${fallbackPath} must be short`);
-  assert.match(fallbackPath, /space-cli-[0-9a-f]{12}\.sock$/);
+  assert.match(fallbackPath, /(?:space-cli|s)-[0-9a-f]{12}\.sock$/);
 
   // 3. Explicit env override: respects SPACE_CLI_HOST_SOCKET
   const customSocket = "/custom/path/to/socket.sock";

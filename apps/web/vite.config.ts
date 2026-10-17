@@ -33,6 +33,7 @@ export default defineConfig({
   server: {
     host: process.env.SPACE_WEB_HOST ?? "0.0.0.0",
     port: Number.parseInt(process.env.SPACE_WEB_PORT ?? "4911", 10),
+    strictPort: true,
     proxy: {
       "/api": {
         target: process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910",

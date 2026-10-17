@@ -144,36 +144,61 @@ async function verifyStarterRoomAndCliPane(cookie) {
     throw new Error(`Required OpenCode CLI pane is missing in starter room ${roomId}`);
   }
 
-  console.log(`Verifying CLI session on pane ${opencodePaneId}...`);
-  const sessionRes = await fetch(`${API_ORIGIN}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/session`, {
-    headers: { Cookie: cookie || "" }
+  console.log(`Starting OpenCode CLI session on pane ${opencodePaneId}...`);
+  const startSessionRes = await fetch(`${API_ORIGIN}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/session`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: cookie || ""
+    },
+    body: JSON.stringify({})
   });
-
-  if (!sessionRes.ok) {
-    const errText = await sessionRes.text();
-    throw new Error(`CLI session request failed (${sessionRes.status}): ${errText}`);
+  if (!startSessionRes.ok) {
+    const errText = await startSessionRes.text();
+    console.warn(`Initial CLI start returned ${startSessionRes.status}: ${errText}`);
   }
 
-  const sessionData = await sessionRes.json();
-  console.log(`CLI session verified successfully:`, sessionData.session?.id || sessionData.status || sessionRes.status);
+  // Poll CLI session until status is active/running
+  let sessionConfirmed = false;
+  let lastSessionData = null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const sessionRes = await fetch(`${API_ORIGIN}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/session`, {
+      headers: { Cookie: cookie || "" }
+    });
+    if (sessionRes.ok) {
+      lastSessionData = await sessionRes.json();
+      if (lastSessionData.session?.id || lastSessionData.status === "RUNNING" || lastSessionData.session?.status === "RUNNING") {
+        sessionConfirmed = true;
+        break;
+      }
+    }
+    await sleep(1000);
+  }
+
+  if (!sessionConfirmed) {
+    throw new Error(`OpenCode CLI session failed to start or verify running: ${JSON.stringify(lastSessionData)}`);
+  }
+  console.log(`CLI session verified successfully:`, lastSessionData.session?.id || lastSessionData.status);
 }
 
 /**
- * Triggers dev-stack stop and purge, and asserts that the state directory is completely removed.
+ * Triggers dev-stack stop and purge, and asserts that the state directory,
+ * containers, volumes, and child processes are completely removed.
  *
+ * @param {Array<{ name: string, pid: number }>} [preRecordedPids=[]]
  * @returns {Promise<void>}
- * @throws {Error} If state root still exists after reset.
+ * @throws {Error} If cleanup assertions fail.
  */
-async function verifyResetCleanup() {
+async function verifyResetCleanup(preRecordedPids = []) {
   console.log("Running dev:stack -- reset to verify full cleanup...");
 
-  // Capture all recorded dev-stack child PIDs before cleanup
-  const recordedPids = [];
+  // Capture any lingering dev-stack child PIDs from pidfile if available
+  const recordedPids = [...preRecordedPids];
   if (existsSync(config.pidFile)) {
     try {
       const pidsObj = JSON.parse(readFileSync(config.pidFile, "utf8"));
       for (const [name, pid] of Object.entries(pidsObj)) {
-        if (typeof pid === "number") {
+        if (typeof pid === "number" && !recordedPids.some((p) => p.pid === pid)) {
           recordedPids.push({ name, pid });
         }
       }
@@ -206,7 +231,10 @@ async function verifyResetCleanup() {
   const psCheck = spawnSync("docker", ["compose", "-p", config.composeProject, "ps", "-a", "-q"], {
     encoding: "utf8"
   });
-  if (psCheck.status === 0 && psCheck.stdout.trim().length > 0) {
+  if (psCheck.status !== 0) {
+    throw new Error(`Failed to query Docker containers after reset (exit code ${psCheck.status}): ${psCheck.stderr || psCheck.stdout}`);
+  }
+  if (psCheck.stdout.trim().length > 0) {
     throw new Error(`Compose project containers still exist after reset: ${psCheck.stdout.trim()}`);
   }
 
@@ -214,7 +242,10 @@ async function verifyResetCleanup() {
   const volCheck = spawnSync("docker", ["volume", "ls", "--filter", `label=com.docker.compose.project=${config.composeProject}`, "-q"], {
     encoding: "utf8"
   });
-  if (volCheck.status === 0 && volCheck.stdout.trim().length > 0) {
+  if (volCheck.status !== 0) {
+    throw new Error(`Failed to query Docker volumes after reset (exit code ${volCheck.status}): ${volCheck.stderr || volCheck.stdout}`);
+  }
+  if (volCheck.stdout.trim().length > 0) {
     throw new Error(`Compose project volumes still exist after reset: ${volCheck.stdout.trim()}`);
   }
 
@@ -262,6 +293,19 @@ async function main() {
     const { cookie } = await claimOwner(setupToken);
     await verifyStarterRoomAndCliPane(cookie);
 
+    // Capture live dev-stack child PIDs while stack is actively running
+    const activePids = [];
+    if (existsSync(config.pidFile)) {
+      try {
+        const pidsObj = JSON.parse(readFileSync(config.pidFile, "utf8"));
+        for (const [name, pid] of Object.entries(pidsObj)) {
+          if (typeof pid === "number") {
+            activePids.push({ name, pid });
+          }
+        }
+      } catch {}
+    }
+
     if (unexpectedExitError) throw unexpectedExitError;
     console.log("All functional gate assertions PASSED!");
   } finally {
@@ -283,7 +327,7 @@ async function main() {
         });
       } catch {}
     }
-    await verifyResetCleanup();
+    await verifyResetCleanup(activePids);
     if (unexpectedExitError) throw unexpectedExitError;
   }
 }

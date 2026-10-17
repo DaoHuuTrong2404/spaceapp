@@ -83,7 +83,7 @@ This single command:
 | **Web UI** | `http://127.0.0.1:5911` | Vite web frontend with HMR & API proxy |
 | **API Server** | `http://127.0.0.1:5910` | Fastify API backend (`/readyz`, `/api/*`) |
 | **PostgreSQL** | `127.0.0.1:54329` | Isolated pgvector database |
-| **Temporal UI / gRPC** | `127.0.0.1:57233` | Temporal workflow engine |
+| **Temporal gRPC** | `127.0.0.1:57233` | Temporal workflow engine gRPC endpoint |
 
 ### Stopping, inspecting, and resetting the stack
 
