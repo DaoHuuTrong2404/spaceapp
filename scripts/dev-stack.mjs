@@ -411,7 +411,7 @@ async function waitForComposeHealthy(composeProject, composeFile, service, timeo
  * @param {string[]} args
  * @param {object} [options={}]
  */
-function runCommand(command, args, options = {}) {
+export function runCommand(command, args, options = {}) {
   const res = spawnSync(command, args, { stdio: "inherit", ...options });
   if (res.error) throw res.error;
   if (res.status !== 0) throw new Error(`${command} ${args.join(" ")} exited with code ${res.status}`);
@@ -746,9 +746,11 @@ export async function stopDevStack(config, { purge = false } = {}) {
  * Spawns Docker dependencies, runs migrations, prepares opencode wrapper, and launches child servers.
  *
  * @param {ReturnType<typeof resolveDevStackConfig>} config
+ * @param {object} [options={}]
+ * @param {typeof runCommand} [options.runCmd=runCommand]
  * @returns {Promise<void>}
  */
-export async function startDevStack(config) {
+export async function startDevStack(config, { runCmd = runCommand } = {}) {
   console.log("Starting SpaceApp dev-stack from source...");
 
   let ownsLifecycle = false;
@@ -875,7 +877,7 @@ export async function startDevStack(config) {
   writeFileSync(composeFile, composeYaml, "utf8");
 
   console.log(`Starting Docker dependencies (postgres and temporal, project: ${config.composeProject})...`);
-  runCommand("docker", ["compose", "-p", config.composeProject, "-f", composeFile, "up", "-d"]);
+  runCmd("docker", ["compose", "-p", config.composeProject, "-f", composeFile, "up", "-d"]);
 
   console.log(`Waiting for PostgreSQL on 127.0.0.1:${config.postgresPort}...`);
   await waitForPort(config.postgresPort, "127.0.0.1", 60000);
@@ -884,10 +886,10 @@ export async function startDevStack(config) {
   await waitForComposeHealthy(config.composeProject, composeFile, "temporal", 120000);
 
   console.log("Compiling workspace packages before migrations...");
-  runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:packages"]);
+  runCmd(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:packages"]);
 
   console.log("Running database migrations...");
-  runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "db:migrate"], {
+  runCmd(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "db:migrate"], {
     env: {
       ...process.env,
       SPACE_DATABASE_URL: secrets.databaseUrl
@@ -898,7 +900,7 @@ export async function startDevStack(config) {
   setupOpencodeWrapper(config, opencodeVersion);
 
   console.log("Compiling worker application...");
-  runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build", "-w", "@space/worker"]);
+  runCmd(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build", "-w", "@space/worker"]);
 
   // Spawn services
   const cliSocketPath = config.cliSocketPath || resolveCliHostSocketPath(config.runDir);

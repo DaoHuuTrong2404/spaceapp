@@ -561,9 +561,10 @@ test("fresh startup interaction: acquires lock and initializes state marker and 
 
 /**
  * Verifies that calling startDevStack with a completely non-existent stateRoot
- * initializes the state root, acquires the lock, and does not fail on the fresh directory adoption guard.
+ * initializes the state root, acquires the lock, creates the marker, secrets, and compose file,
+ * and halts cleanly at the Compose execution boundary without starting real containers or child processes.
  */
-test("startDevStack succeeds in adopting and initializing a non-existent fresh state directory", async () => {
+test("startDevStack adopts and initializes non-existent fresh state directory and stops cleanly at Compose boundary", async () => {
   const tmpRoot = path.join(os.tmpdir(), "spaceapp-test-start-fresh-" + Date.now());
   assert.equal(fs.existsSync(tmpRoot), false);
 
@@ -575,16 +576,48 @@ test("startDevStack succeeds in adopting and initializing a non-existent fresh s
     SPACE_DEV_TEMPORAL_PORT: "57243"
   });
 
+  const MOCK_COMPOSE_STOP_ERR = "MOCK_COMPOSE_BOUNDARY_STOP";
+  let composeCommandIntercepted = false;
+
   try {
-    await startDevStack(config);
-  } catch (err) {
-    // If docker is unavailable in test environment, it will fail at docker compose,
-    // but it MUST NOT fail on the fresh directory adoption guard!
-    assert.doesNotMatch(
-      err.message,
-      /Refusing to adopt non-empty existing directory/,
-      "startDevStack must not fail on the fresh directory adoption guard"
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: (cmd, args) => {
+            if (cmd === "docker" && args.includes("compose")) {
+              composeCommandIntercepted = true;
+              throw new Error(MOCK_COMPOSE_STOP_ERR);
+            }
+          }
+        });
+      },
+      (err) => {
+        assert.equal(err.message, MOCK_COMPOSE_STOP_ERR);
+        return true;
+      }
     );
+
+    // Verify Compose command was reached
+    assert.equal(composeCommandIntercepted, true, "Execution must reach the Docker compose boundary");
+
+    // Verify state directory, marker, secrets, and compose file were cleanly created
+    assert.ok(fs.existsSync(tmpRoot), "State directory must exist");
+
+    const markerPath = path.join(tmpRoot, ".dev-stack-state.json");
+    assert.ok(fs.existsSync(markerPath), ".dev-stack-state.json marker must exist");
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+    assert.equal(marker.createdBy, "spaceapp-dev-stack");
+
+    const composePath = path.join(tmpRoot, "docker-compose.yml");
+    assert.ok(fs.existsSync(composePath), "docker-compose.yml must exist");
+    const composeYaml = fs.readFileSync(composePath, "utf8");
+    assert.match(composeYaml, /postgres:/);
+    assert.match(composeYaml, /temporal:/);
+
+    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "postgres-password")), "postgres-password must exist");
+    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "session-secret")), "session-secret must exist");
+    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "setup-token")), "setup-token must exist");
+    assert.ok(fs.existsSync(path.join(tmpRoot, "secrets", "database-url")), "database-url must exist");
   } finally {
     try {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
