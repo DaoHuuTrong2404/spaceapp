@@ -178,7 +178,7 @@ services:
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/docker.yaml
     entrypoint: ["/bin/sh", "-ec"]
     command:
-      - export POSTGRES_PWD="$$(cat /run/secrets/postgres-password)"; if id temporal >/dev/null 2>&1 && command -v su-exec >/dev/null 2>&1; then exec su-exec temporal /etc/temporal/entrypoint.sh autosetup; elif id temporal >/dev/null 2>&1 && command -v gosu >/dev/null 2>&1; then exec gosu temporal /etc/temporal/entrypoint.sh autosetup; else exec /etc/temporal/entrypoint.sh autosetup; fi
+      - export POSTGRES_PWD="$$(cat /run/secrets/postgres-password)"; if id temporal >/dev/null 2>&1; then exec su -s /bin/sh temporal -c 'export POSTGRES_PWD="$$POSTGRES_PWD"; exec /etc/temporal/entrypoint.sh autosetup'; else exec /etc/temporal/entrypoint.sh autosetup; fi
     secrets:
       - source: postgres-password
         target: /run/secrets/postgres-password
@@ -211,7 +211,17 @@ export function ensureSecrets(config) {
   assertSafeStateDir(stateRoot, ROOT);
 
   const markerPath = path.join(stateRoot, ".dev-stack-state.json");
-  if (!existsSync(markerPath)) {
+  if (existsSync(markerPath)) {
+    try {
+      const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+      if (marker.createdBy !== "spaceapp-dev-stack") {
+        throw new Error(`Refusing to use state directory with invalid marker: ${stateRoot}`);
+      }
+    } catch (e) {
+      if (e.message.includes("Refusing")) throw e;
+      throw new Error(`Refusing to use state directory with corrupted marker: ${stateRoot}`);
+    }
+  } else {
     if (existsSync(stateRoot)) {
       const existingEntries = readdirSync(stateRoot);
       if (existingEntries.length > 0) {
@@ -545,20 +555,22 @@ export function assertSafeStateDir(stateRoot, repoRoot = ROOT, { requireMarker =
     }
   }
 
-  // 4. Marker file verification on purge
-  if (requireMarker && existsSync(resolvedState)) {
+  // 4. Marker file verification on purge or when directory exists
+  if (existsSync(resolvedState)) {
     const markerFile = path.join(resolvedState, ".dev-stack-state.json");
-    if (!existsSync(markerFile)) {
+    if (requireMarker && !existsSync(markerFile)) {
       throw new Error(`Refusing to delete state directory missing .dev-stack-state.json marker: ${stateRoot}`);
     }
-    try {
-      const marker = JSON.parse(readFileSync(markerFile, "utf8"));
-      if (marker.createdBy !== "spaceapp-dev-stack") {
-        throw new Error(`Refusing to delete state directory with invalid marker: ${stateRoot}`);
+    if (existsSync(markerFile)) {
+      try {
+        const marker = JSON.parse(readFileSync(markerFile, "utf8"));
+        if (marker.createdBy !== "spaceapp-dev-stack") {
+          throw new Error(`Refusing to delete state directory with invalid marker: ${stateRoot}`);
+        }
+      } catch (e) {
+        if (e.message.includes("Refusing")) throw e;
+        throw new Error(`Refusing to delete state directory with corrupted marker: ${stateRoot}`);
       }
-    } catch (e) {
-      if (e.message.includes("Refusing")) throw e;
-      throw new Error(`Refusing to delete state directory with corrupted marker: ${stateRoot}`);
     }
   }
 }
@@ -571,16 +583,25 @@ export function assertSafeStateDir(stateRoot, repoRoot = ROOT, { requireMarker =
  * @returns {Promise<void>}
  */
 export async function stopDevStack(config, { purge = false } = {}) {
+  // CRITICAL: Validate state directory and ownership marker BEFORE any destructive action
+  assertSafeStateDir(config.stateRoot, ROOT, { requireMarker: purge });
+
   const composeFile = path.join(config.stateRoot, "docker-compose.yml");
   console.log("Stopping dev-stack processes and containers...");
 
-  // Kill running child processes if pidfile exists
+  // Kill running child processes if pidfile exists, and WAIT for them to exit with deadline & escalation
   if (existsSync(config.pidFile)) {
+    let recordedPids = [];
     try {
       const pids = JSON.parse(readFileSync(config.pidFile, "utf8"));
-      for (const [name, pid] of Object.entries(pids)) {
+      recordedPids = Object.values(pids).filter((p) => typeof p === "number");
+      for (const pid of recordedPids) {
         try {
-          process.kill(pid, "SIGTERM");
+          if (process.platform === "win32") {
+            spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+          } else {
+            process.kill(pid, "SIGTERM");
+          }
         } catch {
           // Process might already be dead
         }
@@ -588,7 +609,52 @@ export async function stopDevStack(config, { purge = false } = {}) {
     } catch {
       // Ignore pidfile read errors
     }
+
+    // Wait up to 5s for child processes to exit cleanly
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const alive = recordedPids.filter((pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (alive.length === 0) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    // Escalate to SIGKILL if any still alive
+    if (process.platform !== "win32") {
+      for (const pid of recordedPids) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {}
+      }
+    }
+
+    const stillAlive = recordedPids.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (stillAlive.length > 0 && purge) {
+      throw new Error(`Failed to terminate child processes (${stillAlive.join(", ")}). Aborting state purge.`);
+    }
+
     rmSync(config.pidFile, { force: true });
+  }
+
+  // Release state lock if present
+  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+  if (existsSync(lockFile)) {
+    try {
+      rmSync(lockFile, { force: true });
+    } catch {}
   }
 
   if (existsSync(composeFile)) {
@@ -605,7 +671,6 @@ export async function stopDevStack(config, { purge = false } = {}) {
   }
 
   if (purge) {
-    assertSafeStateDir(config.stateRoot, ROOT, { requireMarker: true });
     console.log(`Purging state directory: ${config.stateRoot}`);
     rmSync(config.stateRoot, { recursive: true, force: true });
     if (config.cliSocketPath && existsSync(config.cliSocketPath)) {
@@ -625,6 +690,29 @@ export async function stopDevStack(config, { purge = false } = {}) {
  */
 export async function startDevStack(config) {
   console.log("Starting SpaceApp dev-stack from source...");
+
+  // Validate stateRoot early
+  assertSafeStateDir(config.stateRoot, ROOT);
+
+  const lockFile = path.join(config.stateRoot, "dev-stack.lock");
+  if (existsSync(lockFile)) {
+    try {
+      const lockData = JSON.parse(readFileSync(lockFile, "utf8"));
+      if (lockData.pid && typeof lockData.pid === "number") {
+        let isAlive = false;
+        try {
+          process.kill(lockData.pid, 0);
+          isAlive = true;
+        } catch {}
+        if (isAlive) {
+          throw new Error(`Dev stack is already running in state directory ${config.stateRoot} (PID: ${lockData.pid}). Refusing to start duplicate stack.`);
+        }
+      }
+    } catch (e) {
+      if (e.message && e.message.includes("already running")) throw e;
+      // Stale or unreadable lock file can be superseded
+    }
+  }
 
   const children = new Map();
   let stopping = false;
@@ -653,12 +741,19 @@ export async function startDevStack(config) {
 
   try {
     const composeContent = readFileSync(TEMPLATE_COMPOSE_PATH, "utf8");
-  const dockerfileContent = readFileSync(DOCKERFILE_PATH, "utf8");
+    const dockerfileContent = readFileSync(DOCKERFILE_PATH, "utf8");
 
-  const images = parsePinnedImages(composeContent);
-  const opencodeVersion = parsePinnedOpencodeVersion(dockerfileContent);
+    const images = parsePinnedImages(composeContent);
+    const opencodeVersion = parsePinnedOpencodeVersion(dockerfileContent);
 
-  const secrets = ensureSecrets(config);
+    const secrets = ensureSecrets(config);
+
+    // Acquire state lock now that secrets/marker are validated
+    writeFileSync(
+      lockFile,
+      JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n",
+      { mode: 0o600 }
+    );
   const composeYaml = generateDevComposeYaml({
     postgresImage: images.postgres,
     temporalImage: images.temporal,
@@ -735,7 +830,9 @@ export async function startDevStack(config) {
     SPACE_PROJECTS_ROOT: path.join(config.varDir, "projects"),
     SPACE_INSTALL_ROOT: config.stateRoot,
     SPACE_CLI_VPN_LAUNCHER: path.join(config.binDir, "space-cli-vpn-launcher"),
-    SPACE_CODEX_APP_SERVER_COMMAND: path.join(config.binDir, "codex-vscode-parity")
+    SPACE_CODEX_APP_SERVER_COMMAND: path.join(config.binDir, "codex-vscode-parity"),
+    SPACE_CHESS_MOVE_SOCKET: "disabled",
+    SPACE_CHESS_CLI_WORKSPACE: path.join(config.varDir, "chess-workspace")
   };
 
   mkdirSync(envCommon.SPACE_MEMORY_ROOT, { recursive: true });
@@ -850,6 +947,9 @@ export async function startDevStack(config) {
   } catch (err) {
     if (!stopping) {
       stopping = true;
+      if (err.message && err.message.includes("already running")) {
+        throw err;
+      }
       console.error(`\n[dev-stack] Startup error: ${err.message}. Cleaning up resources...`);
       for (const [name, child] of children) {
         try {

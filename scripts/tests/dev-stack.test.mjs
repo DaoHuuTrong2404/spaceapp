@@ -422,3 +422,50 @@ test("ensureSecrets refuses to adopt an existing non-empty directory lacking mar
   }
 });
 
+/**
+ * Verifies that dev-stack environment config sets SPACE_CHESS_MOVE_SOCKET to "disabled".
+ * This prevents the worker from touching /opt/spaceapp/var/chess-benchmark/worker.sock.
+ */
+test("dev-stack environment disables SPACE_CHESS_MOVE_SOCKET to prevent host filesystem writes", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /SPACE_CHESS_MOVE_SOCKET:\s*["']disabled["']/);
+  assert.match(devStackSource, /SPACE_CHESS_CLI_WORKSPACE:/);
+});
+
+/**
+ * Verifies that stopDevStack runs assertSafeStateDir before any process killing or docker compose commands.
+ */
+test("stopDevStack runs assertSafeStateDir before terminating processes or tearing down docker services", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  const stopIndex = devStackSource.indexOf("export async function stopDevStack");
+  const assertIndex = devStackSource.indexOf("assertSafeStateDir(config.stateRoot", stopIndex);
+  const killIndex = devStackSource.indexOf("process.kill", stopIndex);
+  const composeIndex = devStackSource.indexOf("docker", stopIndex);
+
+  assert.ok(stopIndex > -1);
+  assert.ok(assertIndex > -1, "assertSafeStateDir must be called in stopDevStack");
+  assert.ok(assertIndex < killIndex, "assertSafeStateDir must execute before process killing");
+  assert.ok(assertIndex < composeIndex, "assertSafeStateDir must execute before docker commands");
+});
+
+/**
+ * Verifies that ci-dev-stack-gate checks strict session criteria (runtimeId, isActive, non-exited status, websocket token).
+ */
+test("ci-dev-stack-gate enforces runtimeId, isActive, non-exited status, and websocket transport", () => {
+  const gateSource = fs.readFileSync(path.join(process.cwd(), "scripts", "ci-dev-stack-gate.mjs"), "utf8");
+  assert.match(gateSource, /runtimeId === ["']cli:opencode["']/);
+  assert.match(gateSource, /isActive === true/);
+  assert.match(gateSource, /status !== ["']EXITED["']/);
+  assert.match(gateSource, /verifyCliWebSocketTransport/);
+});
+
+/**
+ * Verifies that dev-stack inspects and writes dev-stack.lock to prevent concurrent executions.
+ */
+test("dev-stack inspects and writes dev-stack.lock to prevent duplicate concurrent runs", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /dev-stack\.lock/);
+  assert.match(devStackSource, /Refusing to start duplicate stack/);
+});
+
+

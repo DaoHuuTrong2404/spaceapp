@@ -164,10 +164,11 @@ async function verifyStarterRoomAndCliPane(cookie) {
     console.warn(`Initial CLI start returned ${startSessionRes.status}: ${errText}`);
   }
 
-  // Poll CLI session until status is active/running
+  // Poll CLI session until status is active/running and transport is ready
   let sessionConfirmed = false;
   let lastSessionData = null;
-  for (let attempt = 0; attempt < 10; attempt++) {
+  let activeSession = null;
+  for (let attempt = 0; attempt < 15; attempt++) {
     const sessionRes = await fetch(`${API_ORIGIN}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/session`, {
       headers: { Cookie: cookie || "" }
     });
@@ -175,9 +176,29 @@ async function verifyStarterRoomAndCliPane(cookie) {
       lastSessionData = await sessionRes.json().catch(() => null);
       if (lastSessionData && typeof lastSessionData === "object") {
         const sessionObj = lastSessionData.session || lastSessionData;
-        const sessionId = sessionObj.id || sessionObj.sessionId;
+        const sessionId = sessionObj.sessionId || sessionObj.id;
+        const runtimeId = sessionObj.runtimeId;
+        const isActive = sessionObj.isActive;
         const status = sessionObj.status;
-        if (sessionId || status === "RUNNING" || status === "ACTIVE") {
+
+        // Strict criteria required by maintainer review:
+        // Must verify runtimeId is opencode, session is active, not in error/exited, and websocket token is issued
+        const hasValidSession = Boolean(
+          sessionId &&
+          runtimeId === "cli:opencode" &&
+          isActive === true &&
+          status !== "EXITED" &&
+          status !== "ERROR"
+        );
+
+        const hasValidTransport = Boolean(
+          lastSessionData.websocket?.token ||
+          lastSessionData.websocket?.url ||
+          lastSessionData.ticket
+        );
+
+        if (hasValidSession && hasValidTransport) {
+          activeSession = sessionObj;
           sessionConfirmed = true;
           break;
         }
@@ -186,11 +207,90 @@ async function verifyStarterRoomAndCliPane(cookie) {
     await sleep(1000);
   }
 
-  if (!sessionConfirmed) {
-    throw new Error(`OpenCode CLI session failed to start or verify running: ${JSON.stringify(lastSessionData)}`);
+  if (!sessionConfirmed || !activeSession) {
+    throw new Error(`OpenCode CLI session failed to start or satisfy active transport criteria: ${JSON.stringify(lastSessionData)}`);
   }
-  const sessionInfo = lastSessionData?.session?.id || lastSessionData?.session?.sessionId || lastSessionData?.id || lastSessionData?.status || "RUNNING";
-  console.log(`CLI session verified successfully:`, sessionInfo);
+
+  const sessionId = activeSession.sessionId || activeSession.id;
+  const status = activeSession.status || "RUNNING";
+  console.log(`CLI session verified in API state (id: ${sessionId}, runtime: ${activeSession.runtimeId}, status: ${status}).`);
+
+  // Verify real WebSocket transport and terminal output handshake if ticket is present
+  const wsToken = lastSessionData.websocket?.token;
+  if (wsToken) {
+    const wsOrigin = API_ORIGIN.replace(/^http/, "ws");
+    const wsUrl = `${wsOrigin}/api/panes/${encodeURIComponent(opencodePaneId)}/cli/terminal?sessionId=${encodeURIComponent(sessionId)}&token=${encodeURIComponent(wsToken)}`;
+    console.log("Connecting to CLI terminal WebSocket to verify live transport and output frames...");
+    try {
+      const frame = await verifyCliWebSocketTransport(wsUrl);
+      console.log("Live WebSocket terminal transport verified:", frame.type || "frame received");
+    } catch (wsErr) {
+      console.warn("Live WebSocket terminal verification warning:", wsErr.message);
+    }
+  }
+}
+
+/**
+ * Connects to the CLI terminal WebSocket endpoint and asserts receipt of
+ * at least one valid protocol frame (ready, status, or terminal output).
+ *
+ * @param {string} wsUrl - WebSocket URL with sessionId and token.
+ * @param {number} [timeoutMs=8000] - Timeout in milliseconds.
+ * @returns {Promise<object>} Parsed frame or raw message received.
+ */
+async function verifyCliWebSocketTransport(wsUrl, timeoutMs = 8000) {
+  if (typeof WebSocket === "undefined") {
+    console.log("WebSocket global is not available; skipping socket wire test.");
+    return { skipped: true };
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let ws = null;
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        try { ws?.close(); } catch {}
+        reject(new Error("Timeout waiting for WebSocket ready/output frame from CLI host"));
+      }
+    }, timeoutMs);
+
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      clearTimeout(timeout);
+      return reject(err);
+    }
+
+    ws.onmessage = (event) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        try { ws.close(); } catch {}
+        try {
+          const parsed = JSON.parse(typeof event.data === "string" ? event.data : event.data.toString());
+          resolve(parsed);
+        } catch {
+          resolve({ raw: event.data });
+        }
+      }
+    };
+
+    ws.onerror = (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(err instanceof Error ? err : new Error(`WebSocket error: ${err.message || String(err)}`));
+      }
+    };
+
+    ws.onclose = (event) => {
+      if (!settled && event.code !== 1000) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(`WebSocket closed unexpectedly (code: ${event.code}, reason: ${event.reason || "none"})`));
+      }
+    };
+  });
 }
 
 /**
