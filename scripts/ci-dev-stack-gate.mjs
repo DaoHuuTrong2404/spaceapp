@@ -113,7 +113,8 @@ async function verifyStarterRoomAndCliPane(cookie) {
   }
 
   const allRooms = await panesRes.json();
-  const targetRoom = allRooms.items?.find((r) => r.id === roomId) || roomData.room;
+  const roomsList = Array.isArray(allRooms.data) ? allRooms.data : (Array.isArray(allRooms) ? allRooms : []);
+  const targetRoom = roomsList.find((r) => r.id === roomId) || allRooms.items?.find((r) => r.id === roomId) || roomData.room || {};
 
   // Locate OpenCode CLI pane or create one if absent
   let opencodePaneId = targetRoom.panes?.find((p) => p.terminalRuntimeId === "cli:opencode" || p.mode === "TERMINAL")?.id;
@@ -126,14 +127,17 @@ async function verifyStarterRoomAndCliPane(cookie) {
         Cookie: cookie || ""
       },
       body: JSON.stringify({
-        title: "OpenCode CLI",
-        mode: "TERMINAL",
-        terminalRuntimeId: "cli:opencode"
+        panes: [
+          {
+            mode: "TERMINAL",
+            terminalRuntimeId: "cli:opencode"
+          }
+        ]
       })
     });
     if (createPaneRes.ok) {
       const createdPaneData = await createPaneRes.json();
-      opencodePaneId = createdPaneData.pane?.id || createdPaneData.id;
+      opencodePaneId = createdPaneData.data?.[0]?.id || createdPaneData.pane?.id || createdPaneData.id;
     } else {
       const errText = await createPaneRes.text();
       throw new Error(`OpenCode CLI pane not found and failed to create pane (${createPaneRes.status}): ${errText}`);
@@ -151,7 +155,9 @@ async function verifyStarterRoomAndCliPane(cookie) {
       "Content-Type": "application/json",
       Cookie: cookie || ""
     },
-    body: JSON.stringify({})
+    body: JSON.stringify({
+      runtimeId: "cli:opencode"
+    })
   });
   if (!startSessionRes.ok) {
     const errText = await startSessionRes.text();
@@ -166,10 +172,15 @@ async function verifyStarterRoomAndCliPane(cookie) {
       headers: { Cookie: cookie || "" }
     });
     if (sessionRes.ok) {
-      lastSessionData = await sessionRes.json();
-      if (lastSessionData.session?.id || lastSessionData.status === "RUNNING" || lastSessionData.session?.status === "RUNNING") {
-        sessionConfirmed = true;
-        break;
+      lastSessionData = await sessionRes.json().catch(() => null);
+      if (lastSessionData && typeof lastSessionData === "object") {
+        const sessionObj = lastSessionData.session || lastSessionData;
+        const sessionId = sessionObj.id || sessionObj.sessionId;
+        const status = sessionObj.status;
+        if (sessionId || status === "RUNNING" || status === "ACTIVE") {
+          sessionConfirmed = true;
+          break;
+        }
       }
     }
     await sleep(1000);
@@ -178,7 +189,8 @@ async function verifyStarterRoomAndCliPane(cookie) {
   if (!sessionConfirmed) {
     throw new Error(`OpenCode CLI session failed to start or verify running: ${JSON.stringify(lastSessionData)}`);
   }
-  console.log(`CLI session verified successfully:`, lastSessionData.session?.id || lastSessionData.status);
+  const sessionInfo = lastSessionData?.session?.id || lastSessionData?.session?.sessionId || lastSessionData?.id || lastSessionData?.status || "RUNNING";
+  console.log(`CLI session verified successfully:`, sessionInfo);
 }
 
 /**
@@ -261,6 +273,7 @@ async function main() {
   let devStackProcess = null;
   let isShuttingDown = false;
   let unexpectedExitError = null;
+  const activePids = [];
 
   try {
     console.log("Starting dev:stack without a TTY...");
@@ -283,6 +296,18 @@ async function main() {
     await waitForReadyz(150000);
     if (unexpectedExitError) throw unexpectedExitError;
 
+    // Capture live dev-stack child PIDs while stack is actively running
+    if (existsSync(config.pidFile)) {
+      try {
+        const pidsObj = JSON.parse(readFileSync(config.pidFile, "utf8"));
+        for (const [name, pid] of Object.entries(pidsObj)) {
+          if (typeof pid === "number" && !activePids.some((p) => p.pid === pid)) {
+            activePids.push({ name, pid });
+          }
+        }
+      } catch {}
+    }
+
     // Read setup token
     const tokenFile = path.join(config.secretsDir, "setup-token");
     if (!existsSync(tokenFile)) {
@@ -293,23 +318,21 @@ async function main() {
     const { cookie } = await claimOwner(setupToken);
     await verifyStarterRoomAndCliPane(cookie);
 
-    // Capture live dev-stack child PIDs while stack is actively running
-    const activePids = [];
-    if (existsSync(config.pidFile)) {
+    if (unexpectedExitError) throw unexpectedExitError;
+    console.log("All functional gate assertions PASSED!");
+  } finally {
+    isShuttingDown = true;
+    if (activePids.length === 0 && existsSync(config.pidFile)) {
       try {
         const pidsObj = JSON.parse(readFileSync(config.pidFile, "utf8"));
         for (const [name, pid] of Object.entries(pidsObj)) {
-          if (typeof pid === "number") {
+          if (typeof pid === "number" && !activePids.some((p) => p.pid === pid)) {
             activePids.push({ name, pid });
           }
         }
       } catch {}
     }
 
-    if (unexpectedExitError) throw unexpectedExitError;
-    console.log("All functional gate assertions PASSED!");
-  } finally {
-    isShuttingDown = true;
     if (devStackProcess) {
       try {
         devStackProcess.kill("SIGTERM");

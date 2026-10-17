@@ -171,6 +171,7 @@ test("generateDevComposeYaml omits fixed container_name, defines healthchecks, a
   assert.match(yaml, /healthcheck:\s*\n\s*test: \["CMD-SHELL", "pg_isready/);
   assert.match(yaml, /temporal operator cluster health/);
   assert.match(yaml, /mode: 0444/);
+  assert.match(yaml, /user: "0:0"/);
 });
 
 /**
@@ -258,16 +259,34 @@ test("assertSafeStateDir prevents accidental deletion of root, home, ancestors, 
   assert.throws(() => assertSafeStateDir("..", repoRoot), /Refusing to delete unsafe state directory/);
   assert.throws(() => assertSafeStateDir(homeDir, repoRoot), /Refusing to delete unsafe state directory/);
   assert.throws(() => assertSafeStateDir(rootDir, repoRoot), /Refusing to delete unsafe state directory/);
-  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "apps"), repoRoot), /Refusing to delete protected repository source folder/);
-  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "packages"), repoRoot), /Refusing to delete protected repository source folder/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "apps"), repoRoot), /Refusing to delete protected repository source subtree/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "apps", "api"), repoRoot), /Refusing to delete protected repository source subtree/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "packages"), repoRoot), /Refusing to delete protected repository source subtree/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "packages", "db"), repoRoot), /Refusing to delete protected repository source subtree/);
+  assert.throws(() => assertSafeStateDir(path.join(repoRoot, "scripts", "dev-stack.mjs"), repoRoot), /Refusing to delete protected repository source subtree/);
 
   // Safe directories must not throw
   const tmpDir = path.join(os.tmpdir(), "safe-test-dev-stack");
-  assert.doesNotThrow(() => assertSafeStateDir(tmpDir, repoRoot));
-  assert.doesNotThrow(() => assertSafeStateDir(path.join(repoRoot, ".dev-stack"), repoRoot));
+  fs.mkdirSync(tmpDir, { recursive: true });
+  try {
+    assert.doesNotThrow(() => assertSafeStateDir(tmpDir, repoRoot));
+    assert.doesNotThrow(() => assertSafeStateDir(path.join(repoRoot, ".dev-stack"), repoRoot));
 
-  // If requireMarker is set, missing marker throws
-  assert.throws(() => assertSafeStateDir(process.cwd(), repoRoot, { requireMarker: true }));
+    // If requireMarker is set, missing marker throws
+    assert.throws(() => assertSafeStateDir(tmpDir, repoRoot, { requireMarker: true }), /missing .dev-stack-state.json marker/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // Invalid marker throws
+  const tmpMarkerDir = path.join(os.tmpdir(), "marker-test-dev-stack");
+  fs.mkdirSync(tmpMarkerDir, { recursive: true });
+  try {
+    fs.writeFileSync(path.join(tmpMarkerDir, ".dev-stack-state.json"), JSON.stringify({ createdBy: "malicious" }));
+    assert.throws(() => assertSafeStateDir(tmpMarkerDir, repoRoot, { requireMarker: true }), /Refusing to delete state directory with invalid marker/);
+  } finally {
+    fs.rmSync(tmpMarkerDir, { recursive: true, force: true });
+  }
 });
 
 /**
@@ -376,5 +395,30 @@ test("resolveCliHostSocketPath handles default short path, long path tmpdir fall
 test("apps/web/vite.config.ts configures WebSocket proxying for /api", () => {
   const viteConfig = fs.readFileSync(path.join(process.cwd(), "apps", "web", "vite.config.ts"), "utf8");
   assert.match(viteConfig, /["']\/api["']:\s*\{\s*target:.*,\s*ws:\s*true\s*\}/s);
+});
+
+/**
+ * Verifies that ensureSecrets refuses to adopt an existing non-empty directory without marker.
+ */
+test("ensureSecrets refuses to adopt an existing non-empty directory lacking marker", () => {
+  const tmpOccupied = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-occupied-"));
+  try {
+    fs.writeFileSync(path.join(tmpOccupied, "user-data.txt"), "important data");
+    const config = {
+      stateRoot: tmpOccupied,
+      secretsDir: path.join(tmpOccupied, "secrets"),
+      runDir: path.join(tmpOccupied, "run"),
+      binDir: path.join(tmpOccupied, "bin"),
+      varDir: path.join(tmpOccupied, "var"),
+      workspacesDir: path.join(tmpOccupied, "workspaces"),
+      postgresPort: 54329
+    };
+    assert.throws(
+      () => ensureSecrets(config),
+      /Refusing to adopt non-empty existing directory without .dev-stack-state.json marker/
+    );
+  } finally {
+    fs.rmSync(tmpOccupied, { recursive: true, force: true });
+  }
 });
 

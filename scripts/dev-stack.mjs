@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -165,6 +165,7 @@ services:
 
   temporal:
     image: ${temporalImage}
+    user: "0:0"
     restart: unless-stopped
     depends_on:
       postgres:
@@ -177,7 +178,7 @@ services:
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/docker.yaml
     entrypoint: ["/bin/sh", "-ec"]
     command:
-      - export POSTGRES_PWD="$$(cat /run/secrets/postgres-password)"; exec /etc/temporal/entrypoint.sh autosetup
+      - export POSTGRES_PWD="$$(cat /run/secrets/postgres-password)"; if id temporal >/dev/null 2>&1 && command -v su-exec >/dev/null 2>&1; then exec su-exec temporal /etc/temporal/entrypoint.sh autosetup; elif id temporal >/dev/null 2>&1 && command -v gosu >/dev/null 2>&1; then exec gosu temporal /etc/temporal/entrypoint.sh autosetup; else exec /etc/temporal/entrypoint.sh autosetup; fi
     secrets:
       - source: postgres-password
         target: /run/secrets/postgres-password
@@ -206,6 +207,24 @@ volumes:
  * @returns {{ password: string, sessionSecret: string, setupToken: string, databaseUrl: string, setupTokenPath: string }}
  */
 export function ensureSecrets(config) {
+  const stateRoot = config.stateRoot || path.dirname(config.secretsDir);
+  assertSafeStateDir(stateRoot, ROOT);
+
+  const markerPath = path.join(stateRoot, ".dev-stack-state.json");
+  if (!existsSync(markerPath)) {
+    if (existsSync(stateRoot)) {
+      const existingEntries = readdirSync(stateRoot);
+      if (existingEntries.length > 0) {
+        throw new Error(`Refusing to adopt non-empty existing directory without .dev-stack-state.json marker as state root: ${stateRoot}`);
+      }
+    }
+    mkdirSync(stateRoot, { recursive: true });
+    writeFileSync(
+      markerPath,
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot, createdAt: new Date().toISOString() }, null, 2) + "\n"
+    );
+  }
+
   mkdirSync(config.secretsDir, { recursive: true });
   mkdirSync(config.runDir, { recursive: true });
   mkdirSync(config.binDir, { recursive: true });
@@ -248,14 +267,7 @@ export function ensureSecrets(config) {
   const hasSetupToken = existsSync(setupTokenPath);
   const setupToken = hasSetupToken ? readFileSync(setupTokenPath, "utf8").trim() : "Already claimed";
 
-  const stateRoot = config.stateRoot || path.dirname(config.secretsDir);
-  const markerPath = path.join(stateRoot, ".dev-stack-state.json");
-  if (!existsSync(markerPath)) {
-    writeFileSync(
-      markerPath,
-      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot, createdAt: new Date().toISOString() }, null, 2) + "\n"
-    );
-  }
+
 
   return {
     password,
@@ -523,13 +535,13 @@ export function assertSafeStateDir(stateRoot, repoRoot = ROOT, { requireMarker =
     throw new Error(`Refusing to delete unsafe state directory (is ancestor of repo or home): ${stateRoot}`);
   }
 
-  // 3. Protected source folder protection within repository
+  // 3. Protected source folder subtree protection within repository
   const relToRepo = path.relative(resolvedRepo, resolvedState);
   if (!relToRepo.startsWith("..") && !path.isAbsolute(relToRepo)) {
     const topFolder = relToRepo.split(path.sep)[0];
     const protectedFolders = new Set(["apps", "packages", "scripts", "docs", "deploy", ".git", ".github", "node_modules"]);
-    if (protectedFolders.has(topFolder) && relToRepo === topFolder) {
-      throw new Error(`Refusing to delete protected repository source folder: ${stateRoot}`);
+    if (protectedFolders.has(topFolder)) {
+      throw new Error(`Refusing to delete protected repository source subtree: ${stateRoot}`);
     }
   }
 
@@ -538,6 +550,15 @@ export function assertSafeStateDir(stateRoot, repoRoot = ROOT, { requireMarker =
     const markerFile = path.join(resolvedState, ".dev-stack-state.json");
     if (!existsSync(markerFile)) {
       throw new Error(`Refusing to delete state directory missing .dev-stack-state.json marker: ${stateRoot}`);
+    }
+    try {
+      const marker = JSON.parse(readFileSync(markerFile, "utf8"));
+      if (marker.createdBy !== "spaceapp-dev-stack") {
+        throw new Error(`Refusing to delete state directory with invalid marker: ${stateRoot}`);
+      }
+    } catch (e) {
+      if (e.message.includes("Refusing")) throw e;
+      throw new Error(`Refusing to delete state directory with corrupted marker: ${stateRoot}`);
     }
   }
 }
@@ -630,7 +651,8 @@ export async function startDevStack(config) {
     process.once(sig, () => shutdown(sig, 0));
   }
 
-  const composeContent = readFileSync(TEMPLATE_COMPOSE_PATH, "utf8");
+  try {
+    const composeContent = readFileSync(TEMPLATE_COMPOSE_PATH, "utf8");
   const dockerfileContent = readFileSync(DOCKERFILE_PATH, "utf8");
 
   const images = parsePinnedImages(composeContent);
@@ -806,8 +828,9 @@ export async function startDevStack(config) {
     } catch {}
     await new Promise((r) => setTimeout(r, 1000));
   }
-  if (!apiReady && !stopping) {
-    console.warn(`\n[WARNING] dev-stack services spawned, but /readyz did not report ok: true within 60s.`);
+  if (!apiReady) {
+    if (stopping) return;
+    throw new Error(`dev-stack services failed to become ready: ${envCommon.SPACE_API_ORIGIN}/readyz did not report ok: true within 60s`);
   }
 
   console.log("\n============================================================");
@@ -824,6 +847,27 @@ export async function startDevStack(config) {
     console.log("Owner account has already been claimed.");
   }
   console.log("Press Ctrl+C to stop the stack.\n");
+  } catch (err) {
+    if (!stopping) {
+      stopping = true;
+      console.error(`\n[dev-stack] Startup error: ${err.message}. Cleaning up resources...`);
+      for (const [name, child] of children) {
+        try {
+          if (process.platform === "win32" && child.pid) {
+            spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
+          } else if (child.pid) {
+            child.kill("SIGTERM");
+          }
+        } catch {}
+      }
+      try {
+        await stopDevStack(config, { purge: false });
+      } catch (cleanupErr) {
+        console.error("[dev-stack] Error during rollback teardown:", cleanupErr.message);
+      }
+    }
+    throw err;
+  }
 }
 
 /**
