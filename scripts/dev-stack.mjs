@@ -61,6 +61,28 @@ export function parsePinnedOpencodeVersion(dockerfileContent) {
 }
 
 /**
+ * Resolves the Unix domain socket path for the CLI host.
+ * Unix domain sockets have strict path length limits (~104 bytes on macOS, ~108 on Linux).
+ * If the computed socket path exceeds 96 bytes (e.g. deeply nested workspaces or custom state dirs),
+ * this falls back safely to os.tmpdir() with a content hash to prevent ENAMETOOLONG or EINVAL.
+ *
+ * @param {string} runDir - Directory where run-time sockets are kept by default.
+ * @param {Record<string, string | undefined>} [env=process.env] - Environment variables map.
+ * @returns {string} Safe absolute socket path.
+ */
+export function resolveCliHostSocketPath(runDir, env = process.env) {
+  if (env && env.SPACE_CLI_HOST_SOCKET) {
+    return env.SPACE_CLI_HOST_SOCKET;
+  }
+  const defaultPath = path.resolve(runDir, "cli-host.sock");
+  if (Buffer.byteLength(defaultPath) <= 96) {
+    return defaultPath;
+  }
+  const hash = crypto.createHash("sha256").update(defaultPath).digest("hex").slice(0, 12);
+  return path.join(os.tmpdir(), `space-cli-${hash}.sock`);
+}
+
+/**
  * Resolves dev-stack configuration from environment variables with defaults.
  *
  * @param {Record<string, string | undefined>} [env=process.env] - Environment variables map.
@@ -74,6 +96,8 @@ export function resolveDevStackConfig(env = process.env) {
   const apiPort = validatePort("apiPort", Number.parseInt(env.SPACE_DEV_API_PORT || env.SPACEAPP_DEV_API_PORT || env.SPACE_API_PORT || "5910", 10));
   const postgresPort = validatePort("postgresPort", Number.parseInt(env.SPACE_DEV_POSTGRES_PORT || env.SPACEAPP_DEV_POSTGRES_PORT || "54329", 10));
   const temporalPort = validatePort("temporalPort", Number.parseInt(env.SPACE_DEV_TEMPORAL_PORT || env.SPACEAPP_DEV_TEMPORAL_PORT || "57233", 10));
+  const runDir = path.join(stateRoot, "run");
+  const cliSocketPath = resolveCliHostSocketPath(runDir, env);
 
   return {
     stateRoot,
@@ -83,12 +107,13 @@ export function resolveDevStackConfig(env = process.env) {
     postgresPort,
     temporalPort,
     secretsDir: path.join(stateRoot, "secrets"),
-    runDir: path.join(stateRoot, "run"),
+    runDir,
     binDir: path.join(stateRoot, "bin"),
     opencodeDir: path.join(stateRoot, "opencode"),
     varDir: path.join(stateRoot, "var"),
     workspacesDir: path.join(stateRoot, "workspaces"),
-    pidFile: path.join(stateRoot, "run", "dev-stack.pid")
+    pidFile: path.join(runDir, "dev-stack.pid"),
+    cliSocketPath
   };
 }
 
@@ -463,6 +488,11 @@ export async function stopDevStack(config, { purge = false } = {}) {
     assertSafeStateDir(config.stateRoot);
     console.log(`Purging state directory: ${config.stateRoot}`);
     rmSync(config.stateRoot, { recursive: true, force: true });
+    if (config.cliSocketPath && existsSync(config.cliSocketPath)) {
+      try {
+        rmSync(config.cliSocketPath, { force: true });
+      } catch {}
+    }
   }
 }
 
@@ -522,7 +552,7 @@ export async function startDevStack(config) {
   runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build", "-w", "@space/worker"]);
 
   // Spawn services
-  const cliSocketPath = path.join(config.runDir, "cli-host.sock");
+  const cliSocketPath = config.cliSocketPath || resolveCliHostSocketPath(config.runDir);
   const children = new Map();
   let stopping = false;
 

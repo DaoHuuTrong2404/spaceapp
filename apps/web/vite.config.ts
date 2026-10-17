@@ -34,7 +34,10 @@ export default defineConfig({
     host: process.env.SPACE_WEB_HOST ?? "0.0.0.0",
     port: Number.parseInt(process.env.SPACE_WEB_PORT ?? "4911", 10),
     proxy: {
-      "/api": process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910",
+      "/api": {
+        target: process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910",
+        ws: true
+      },
       "/plugins": process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910",
       "/healthz": process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910",
       "/readyz": process.env.SPACE_API_ORIGIN ?? "http://127.0.0.1:4910",

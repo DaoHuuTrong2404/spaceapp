@@ -10,6 +10,7 @@ import {
   isComposeServiceHealthy,
   parsePinnedImages,
   parsePinnedOpencodeVersion,
+  resolveCliHostSocketPath,
   resolveDevStackConfig,
   setupOpencodeWrapper,
   validatePort
@@ -327,5 +328,34 @@ test("ensureSecrets preserves claimed setup token and reports already claimed st
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+/**
+ * Verifies that resolveCliHostSocketPath respects Unix domain socket path length constraints.
+ */
+test("resolveCliHostSocketPath handles default short path, long path tmpdir fallback, and env override", () => {
+  // 1. Short path: returns default cli-host.sock within runDir
+  const shortRunDir = path.join(os.tmpdir(), "short");
+  const shortPath = resolveCliHostSocketPath(shortRunDir, {});
+  assert.equal(shortPath, path.resolve(shortRunDir, "cli-host.sock"));
+
+  // 2. Long path (>96 bytes): falls back to os.tmpdir() with space-cli-<hash>.sock
+  const longRunDir = path.join(os.tmpdir(), "a".repeat(120), "deep", "nested", "run");
+  const fallbackPath = resolveCliHostSocketPath(longRunDir, {});
+  assert.ok(Buffer.byteLength(fallbackPath) < 100, `Fallback path ${fallbackPath} must be short`);
+  assert.match(fallbackPath, /space-cli-[0-9a-f]{12}\.sock$/);
+
+  // 3. Explicit env override: respects SPACE_CLI_HOST_SOCKET
+  const customSocket = "/custom/path/to/socket.sock";
+  const customResolved = resolveCliHostSocketPath(shortRunDir, { SPACE_CLI_HOST_SOCKET: customSocket });
+  assert.equal(customResolved, customSocket);
+});
+
+/**
+ * Verifies that apps/web/vite.config.ts configures WebSocket proxying for /api.
+ */
+test("apps/web/vite.config.ts configures WebSocket proxying for /api", () => {
+  const viteConfig = fs.readFileSync(path.join(process.cwd(), "apps", "web", "vite.config.ts"), "utf8");
+  assert.match(viteConfig, /["']\/api["']:\s*\{\s*target:.*,\s*ws:\s*true\s*\}/s);
 });
 
