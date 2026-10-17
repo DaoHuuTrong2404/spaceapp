@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -70,7 +70,38 @@ export function parsePinnedOpencodeVersion(dockerfileContent) {
  * @param {Record<string, string | undefined>} [env=process.env] - Environment variables map.
  * @returns {string} Safe absolute socket path.
  */
-export function resolveCliHostSocketPath(runDir, env = process.env) {
+/**
+ * Computes the deterministic temporary fallback socket path when runDir path length exceeds 96 bytes.
+ *
+ * @param {string} runDir - Directory where default socket would be located.
+ * @param {string} [composeProject=""] - Compose project name for namespace separation.
+ * @returns {string} Safe absolute temporary socket path.
+ */
+export function resolveCliHostSocketFallback(runDir, composeProject = "") {
+  const defaultPath = path.resolve(runDir, "cli-host.sock");
+  const hash = crypto.createHash("sha256").update(defaultPath).digest("hex").slice(0, 12);
+  const prefix = composeProject ? `s-${composeProject.slice(0, 12)}-` : "s-";
+  const fallback = path.join(os.tmpdir(), `${prefix}${hash}.sock`);
+  if (Buffer.byteLength(fallback) <= 96) {
+    return fallback;
+  }
+  if (process.platform !== "win32") {
+    return `/tmp/${prefix}${hash}.sock`;
+  }
+  return fallback;
+}
+
+/**
+ * Resolves the Unix domain socket path for the CLI host process.
+ * Respects SPACE_CLI_HOST_SOCKET override, otherwise falls back to a deterministic
+ * temporary path if the default run directory path exceeds Unix domain length constraints.
+ *
+ * @param {string} runDir - Directory where runtime pid/socket files are stored.
+ * @param {Record<string, string | undefined>} [env=process.env] - Environment variables map.
+ * @param {string} [composeProject=""] - Compose project name.
+ * @returns {string} Safe absolute socket path.
+ */
+export function resolveCliHostSocketPath(runDir, env = process.env, composeProject = "") {
   if (env && env.SPACE_CLI_HOST_SOCKET) {
     return env.SPACE_CLI_HOST_SOCKET;
   }
@@ -78,15 +109,7 @@ export function resolveCliHostSocketPath(runDir, env = process.env) {
   if (Buffer.byteLength(defaultPath) <= 96) {
     return defaultPath;
   }
-  const hash = crypto.createHash("sha256").update(defaultPath).digest("hex").slice(0, 12);
-  const fallback = path.join(os.tmpdir(), `s-${hash}.sock`);
-  if (Buffer.byteLength(fallback) <= 96) {
-    return fallback;
-  }
-  if (process.platform !== "win32") {
-    return `/tmp/s-${hash}.sock`;
-  }
-  return fallback;
+  return resolveCliHostSocketFallback(runDir, composeProject);
 }
 
 /**
@@ -104,7 +127,7 @@ export function resolveDevStackConfig(env = process.env) {
   const postgresPort = validatePort("postgresPort", Number.parseInt(env.SPACE_DEV_POSTGRES_PORT || env.SPACEAPP_DEV_POSTGRES_PORT || "54329", 10));
   const temporalPort = validatePort("temporalPort", Number.parseInt(env.SPACE_DEV_TEMPORAL_PORT || env.SPACEAPP_DEV_TEMPORAL_PORT || "57233", 10));
   const runDir = path.join(stateRoot, "run");
-  const cliSocketPath = resolveCliHostSocketPath(runDir, env);
+  const cliSocketPath = resolveCliHostSocketPath(runDir, env, composeProject);
 
   return {
     stateRoot,
@@ -609,8 +632,9 @@ export function isManagedSocketPath(socketPath, config) {
     }
     const resolved = path.resolve(socketPath);
     const inStateRoot = resolved.startsWith(path.resolve(config.stateRoot) + path.sep);
-    const inTmpManaged = resolved.startsWith(path.resolve(os.tmpdir(), `spaceapp-${config.composeProject}`));
-    return inStateRoot || inTmpManaged;
+    const fallbackPath = path.resolve(resolveCliHostSocketFallback(config.runDir, config.composeProject));
+    const isFallback = resolved === fallbackPath;
+    return inStateRoot || isFallback;
   } catch {
     return false;
   }
@@ -622,62 +646,65 @@ export function isManagedSocketPath(socketPath, config) {
  *
  * @param {number} pid
  * @param {string} [expectedName]
+ * @param {ReturnType<typeof resolveDevStackConfig>} [config]
  * @returns {boolean}
  */
-export function isDevStackProcess(pid, expectedName) {
+export function isDevStackProcess(pid, expectedName, config) {
   if (!pid || typeof pid !== "number") return false;
   try {
     process.kill(pid, 0);
   } catch {
     return false;
   }
+  const rootLower = ROOT.toLowerCase();
+  const stateLower = config?.stateRoot ? path.resolve(config.stateRoot).toLowerCase() : null;
+  const projectLower = config?.composeProject ? config.composeProject.toLowerCase() : null;
+
   try {
+    let cmd = "";
     if (process.platform === "linux") {
       if (existsSync(`/proc/${pid}/cmdline`)) {
-        const cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
-        if (!cmd) return false;
-        return (
-          cmd.includes("spaceapp") ||
-          cmd.includes("dev-stack") ||
-          cmd.includes("node") ||
-          cmd.includes("vite") ||
-          cmd.includes("@space") ||
-          (expectedName && cmd.includes(expectedName))
-        );
+        cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ").toLowerCase();
       }
-      return true;
     } else if (process.platform === "win32") {
       const res = spawnSync("powershell", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`], {
         encoding: "utf8",
         timeout: 2000
       });
       if (res.stdout) {
-        const cmd = res.stdout.toLowerCase();
-        return cmd.includes("node") || cmd.includes("space") || cmd.includes("vite") || cmd.includes("dev-stack");
+        cmd = res.stdout.toLowerCase();
       }
-      return false;
     } else if (process.platform === "darwin") {
       const res = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000 });
       if (res.stdout) {
-        const cmd = res.stdout;
-        return cmd.includes("node") || cmd.includes("space") || cmd.includes("vite") || cmd.includes("dev-stack");
+        cmd = res.stdout.toLowerCase();
       }
-      return false;
     }
+    if (!cmd) return false;
+
+    // Verify ownership by this checkout / stack root / project, NOT just any node process
+    const matchesCheckout = cmd.includes(rootLower) || (stateLower && cmd.includes(stateLower)) || (projectLower && cmd.includes(projectLower));
+    const matchesName =
+      cmd.includes("spaceapp") ||
+      cmd.includes("dev-stack") ||
+      cmd.includes("@space") ||
+      cmd.includes("vite") ||
+      (expectedName && cmd.includes(expectedName.toLowerCase()));
+
+    return Boolean(matchesCheckout && matchesName);
   } catch {
     return false;
   }
-  return true;
 }
 
 /**
  * Stops running dev-stack child processes and Docker Compose services.
  *
  * @param {ReturnType<typeof resolveDevStackConfig>} config
- * @param {{ purge?: boolean, runCmd?: typeof runCommand }} [options]
+ * @param {{ purge?: boolean, runCmd?: typeof runCommand, skipChildSignals?: boolean }} [options]
  * @returns {Promise<void>}
  */
-export async function stopDevStack(config, { purge = false, runCmd = runCommand } = {}) {
+export async function stopDevStack(config, { purge = false, runCmd = runCommand, skipChildSignals = false } = {}) {
   // CRITICAL: Validate state directory and ownership marker BEFORE any destructive action
   assertSafeStateDir(config.stateRoot, ROOT, { requireMarker: purge });
 
@@ -702,11 +729,11 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand 
       supervisorAlive = true;
     } catch {}
 
-    if (supervisorAlive && isDevStackProcess(supervisorPid, "dev-stack")) {
+    if (supervisorAlive && isDevStackProcess(supervisorPid, "dev-stack", config)) {
       console.log(`Coordinating graceful shutdown with supervisor (PID: ${supervisorPid})...`);
       const reqFile = path.join(config.runDir, "shutdown.req");
       try {
-        writeFileSync(reqFile, JSON.stringify({ requestedAt: Date.now(), purge }));
+        writeFileSync(reqFile, JSON.stringify({ requestedAt: Date.now(), supervisorPid, purge, requesterPid: process.pid }));
       } catch {}
 
       try {
@@ -728,6 +755,8 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand 
         if (!purge) {
           return;
         }
+      } else {
+        throw new Error(`Supervisor process (PID ${supervisorPid}) failed to exit within 10s. Aborting teardown to prevent concurrent cleanup.`);
       }
     }
   }
@@ -742,22 +771,24 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand 
       for (const [name, val] of Object.entries(pids)) {
         const pid = typeof val === "number" ? val : val?.pid;
         if (typeof pid === "number") {
-          if (isDevStackProcess(pid, name)) {
+          if (isDevStackProcess(pid, name, config)) {
             recordedPids.push(pid);
           } else {
             console.warn(`[dev-stack] Skipping unverified PID ${pid} (${name}); not identified as dev-stack process.`);
           }
         }
       }
-      for (const pid of recordedPids) {
-        try {
-          if (process.platform === "win32") {
-            spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
-          } else {
-            process.kill(pid, "SIGTERM");
+      if (!skipChildSignals) {
+        for (const pid of recordedPids) {
+          try {
+            if (process.platform === "win32") {
+              spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+            } else {
+              process.kill(pid, "SIGTERM");
+            }
+          } catch {
+            // Process might already be dead
           }
-        } catch {
-          // Process might already be dead
         }
       }
     } catch {
@@ -927,12 +958,13 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
 
       // Lock file already exists: inspect recording PID
       // Give concurrent creator up to 500ms to finish writing payload
+      let rawContent = "";
       let parsedData = null;
       for (let r = 0; r < 5; r++) {
         try {
-          const content = readFileSync(lockFile, "utf8").trim();
-          if (content.length > 0) {
-            parsedData = JSON.parse(content);
+          rawContent = readFileSync(lockFile, "utf8").trim();
+          if (rawContent.length > 0) {
+            parsedData = JSON.parse(rawContent);
             break;
           }
         } catch {}
@@ -1028,9 +1060,10 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
       }
 
       try {
-        await stopDevStack(config, { purge: false, runCmd });
+        await stopDevStack(config, { purge: false, runCmd, skipChildSignals: true });
       } catch (e) {
         console.error("[dev-stack] Teardown error:", e.message);
+        process.exit(1);
       }
       process.exit(exitCode);
     })();
@@ -1042,11 +1075,28 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
   }
 
   // Periodic check for shutdown request from external down command
+  const supervisorStartTime = Date.now();
   const shutdownReqFile = path.join(config.runDir, "shutdown.req");
+  // Clean up any stale shutdown.req from earlier runs before listening
+  try { rmSync(shutdownReqFile, { force: true }); } catch {}
+
   const shutdownWatcher = setInterval(() => {
     if (existsSync(shutdownReqFile)) {
-      try { rmSync(shutdownReqFile, { force: true }); } catch {}
-      shutdown("SIGTERM", 0);
+      try {
+        const rawReq = readFileSync(shutdownReqFile, "utf8");
+        const req = JSON.parse(rawReq);
+        if (req.supervisorPid && req.supervisorPid !== process.pid) {
+          return; // Targeted at a different supervisor
+        }
+        if (req.requestedAt && req.requestedAt < supervisorStartTime) {
+          try { rmSync(shutdownReqFile, { force: true }); } catch {}
+          return; // Stale request from previous run
+        }
+        try { rmSync(shutdownReqFile, { force: true }); } catch {}
+        shutdown("SIGTERM", 0);
+      } catch {
+        try { rmSync(shutdownReqFile, { force: true }); } catch {}
+      }
     }
   }, 400);
   shutdownWatcher.unref();

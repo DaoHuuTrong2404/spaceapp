@@ -11,6 +11,7 @@ import {
   isManagedSocketPath,
   parsePinnedImages,
   parsePinnedOpencodeVersion,
+  resolveCliHostSocketFallback,
   resolveCliHostSocketPath,
   resolveDevStackConfig,
   setupOpencodeWrapper,
@@ -696,8 +697,9 @@ test("stopDevStack preserves external regular files passed as cliSocketPath", as
 
     const config = resolveDevStackConfig({
       SPACE_DEV_STATE_DIR: tmpState,
-      SPACE_DEV_CLI_SOCKET_PATH: importantFile
+      SPACE_CLI_HOST_SOCKET: importantFile
     });
+    assert.equal(config.cliSocketPath, importantFile, "config.cliSocketPath must receive SPACE_CLI_HOST_SOCKET override");
 
     // Run stopDevStack with purge
     await stopDevStack(config, {
@@ -790,6 +792,156 @@ test("startDevStack prevents concurrent execution when active lock is held", asy
     // Assert owner's lock was NOT modified or unlinked
     assert.equal(fs.existsSync(lockFile), true, "Owner lock must remain untouched");
     assert.equal(fs.readFileSync(lockFile, "utf8"), activePayload);
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that isManagedSocketPath correctly recognizes the fallback socket path in tmpdir.
+ */
+test("isManagedSocketPath identifies fallback socket in tmpdir as managed", () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-fallback-"));
+  try {
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+    const fallbackPath = resolveCliHostSocketFallback(config.runDir, config.composeProject);
+    fs.writeFileSync(fallbackPath, "");
+
+    const isManaged = isManagedSocketPath(fallbackPath, config);
+    assert.equal(isManaged, true, "Fallback socket in tmpdir must be recognized as managed");
+
+    // File in tmpdir with different name should NOT be managed
+    const unmanagedPath = path.join(os.tmpdir(), "unrelated-socket.sock");
+    fs.writeFileSync(unmanagedPath, "");
+    assert.equal(isManagedSocketPath(unmanagedPath, config), false, "Unrelated file in tmpdir must not be managed");
+    fs.rmSync(unmanagedPath, { force: true });
+    fs.rmSync(fallbackPath, { force: true });
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that startDevStack reclaims stale dead lock (>15s) when owner PID is inactive.
+ */
+test("startDevStack reclaims stale dead lock older than 15s when owner PID is inactive", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-stale-lock-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    const deadPayload = JSON.stringify({ pid: 99999999, createdAt: new Date(Date.now() - 30000).toISOString() });
+    fs.writeFileSync(lockFile, deadPayload);
+    const pastTime = (Date.now() - 30000) / 1000;
+    fs.utimesSync(lockFile, pastTime, pastTime);
+
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: () => {
+            throw new Error("MOCK_COMPOSE_BOUNDARY_STOP");
+          }
+        });
+      },
+      /MOCK_COMPOSE_BOUNDARY_STOP/
+    );
+
+    assert.equal(fs.existsSync(lockFile), true, "Lock file must exist");
+    const newLock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    assert.equal(newLock.pid, process.pid, "Lock must be reclaimed by current process PID");
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that startDevStack safely handles corrupt/unparseable lock files.
+ */
+test("startDevStack handles corrupt lock file safely", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-corrupt-lock-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    fs.writeFileSync(lockFile, "INVALID_CORRUPT_JSON{{{");
+
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+
+    // Fresh corrupt lock (<15s) must be rejected to prevent race
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: () => {}
+        });
+      },
+      /Dev stack startup is already in progress/
+    );
+
+    // Stale corrupt lock (>15s) can be reclaimed
+    const pastTime = (Date.now() - 30000) / 1000;
+    fs.utimesSync(lockFile, pastTime, pastTime);
+
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: () => {
+            throw new Error("MOCK_COMPOSE_BOUNDARY_STOP");
+          }
+        });
+      },
+      /MOCK_COMPOSE_BOUNDARY_STOP/
+    );
+
+    const reclaimedLock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    assert.equal(reclaimedLock.pid, process.pid, "Corrupt lock must be reclaimed by current process");
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that two contenders attempting startup concurrently result in one owner
+ * and the second failing closed without clobbering the winner's lock.
+ */
+test("two contenders attempting startup concurrently: contender fails without clobbering winner lock", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-contenders-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    const payloadWinner = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() });
+    fs.writeFileSync(lockFile, payloadWinner, { flag: "wx" });
+
+    // Contender attempts to acquire
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: () => {}
+        });
+      },
+      /already running in state directory/
+    );
+
+    // Winner's lock must remain untouched
+    assert.equal(fs.readFileSync(lockFile, "utf8"), payloadWinner);
   } finally {
     fs.rmSync(tmpState, { recursive: true, force: true });
   }

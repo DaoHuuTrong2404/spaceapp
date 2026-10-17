@@ -154,7 +154,8 @@ async function verifyStarterRoomAndCliPane(sessionCookie, csrf) {
       "Content-Type": "application/json",
       Cookie: sessionCookie,
       [csrf.headerName]: csrf.csrfToken
-    }
+    },
+    body: JSON.stringify({})
   });
 
   if (!roomRes.ok) {
