@@ -442,7 +442,11 @@ export async function startDevStack(config) {
     console.log(`\nStopping dev-stack (${signal})...`);
     for (const [name, child] of children) {
       try {
-        child.kill(signal);
+        if (process.platform === "win32" && child.pid) {
+          spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
+        } else if (child.pid) {
+          child.kill(signal);
+        }
       } catch {}
     }
     stopDevStack(config, { purge: false }).then(() => {
@@ -476,11 +480,30 @@ export async function startDevStack(config) {
     SPACE_WEB_HOST: "127.0.0.1",
     SPACE_WEB_PORT: String(config.webPort),
     SPACE_MEMORY_ROOT: path.join(config.varDir, "memory"),
-    SPACE_ARTIFACT_ROOT: path.join(config.varDir, "artifacts")
+    SPACE_ARTIFACT_ROOT: path.join(config.varDir, "artifacts"),
+    SPACE_MEMORY_GRAPH_ROOT: path.join(config.varDir, "memory-graph"),
+    SPACE_APP_DIAGNOSTICS_ROOT: path.join(config.varDir, "app-diagnostics"),
+    SPACE_MAINTENANCE_AUTOPILOT_STATE_FILE: path.join(config.varDir, "maintenance-autopilot", "state.json"),
+    SPACE_TELEGRAM_SECRET_ROOT: path.join(config.secretsDir, "telegram"),
+    SPACE_STREAMING_SECRET_ROOT: path.join(config.secretsDir, "streaming-secrets"),
+    SPACE_DEMO_PROJECTS_ROOT: path.join(config.varDir, "demos"),
+    SPACE_DEMO_PROJECTS_VAR_ROOT: path.join(config.varDir, "demo-projects"),
+    SPACE_PROJECTS_ROOT: path.join(config.varDir, "projects"),
+    SPACE_INSTALL_ROOT: config.stateRoot,
+    SPACE_CLI_VPN_LAUNCHER: path.join(config.binDir, "space-cli-vpn-launcher"),
+    SPACE_CODEX_APP_SERVER_COMMAND: path.join(config.binDir, "codex-vscode-parity")
   };
 
   mkdirSync(envCommon.SPACE_MEMORY_ROOT, { recursive: true });
   mkdirSync(envCommon.SPACE_ARTIFACT_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_MEMORY_GRAPH_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_APP_DIAGNOSTICS_ROOT, { recursive: true });
+  mkdirSync(path.dirname(envCommon.SPACE_MAINTENANCE_AUTOPILOT_STATE_FILE), { recursive: true });
+  mkdirSync(envCommon.SPACE_TELEGRAM_SECRET_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_STREAMING_SECRET_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_DEMO_PROJECTS_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_DEMO_PROJECTS_VAR_ROOT, { recursive: true });
+  mkdirSync(envCommon.SPACE_PROJECTS_ROOT, { recursive: true });
 
   // 1. CLI Host
   console.log("Spawning CLI Host...");

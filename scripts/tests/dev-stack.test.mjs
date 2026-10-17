@@ -182,3 +182,23 @@ test("CONTRIBUTING.md documents all required platforms and commands", () => {
   assert.match(contributing, /Windows 11/);
   assert.match(contributing, /WSL2/);
 });
+
+/**
+ * Verifies that dev-stack overrides all path settings in config.ts that default to /opt/spaceapp.
+ * This guarantees contributor runs never fail with EACCES on macOS or non-root Linux environments.
+ */
+test("dev-stack environment overrides all /opt/spaceapp defaults from config.ts", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  const configSource = fs.readFileSync(path.join(process.cwd(), "apps", "api", "src", "config.ts"), "utf8");
+
+  const optDefaults = [...configSource.matchAll(/(?:env|valid)\.(SPACE_[A-Z0-9_]+)\s*(?:\|\||\?\?)\s*["'](\/opt\/spaceapp[^"']*)["']/g)]
+    .map((m) => m[1]);
+
+  assert.ok(optDefaults.length > 0, "Expected config.ts to have /opt/spaceapp defaults");
+  for (const varName of optDefaults) {
+    assert.ok(
+      devStackSource.includes(varName),
+      `dev-stack.mjs must override ${varName} to prevent EACCES on macOS/non-root Linux`
+    );
+  }
+});
