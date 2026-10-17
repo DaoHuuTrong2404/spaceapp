@@ -207,9 +207,10 @@ test("dev-stack environment overrides all /opt/spaceapp defaults from config.ts"
  * Verifies that ci-dev-stack-gate.mjs strictly asserts the absence of
  * Compose containers and volumes after a dev-stack reset.
  */
-test("ci-dev-stack-gate asserts absence of Compose containers and volumes after reset", () => {
+test("ci-dev-stack-gate asserts absence of Compose containers, volumes, and child processes after reset", () => {
   const gateSource = fs.readFileSync(path.join(process.cwd(), "scripts", "ci-dev-stack-gate.mjs"), "utf8");
   assert.match(gateSource, /compose.*ps.*-a.*-q/);
   assert.match(gateSource, /volume.*ls.*--filter/);
+  assert.match(gateSource, /process\.kill\(pid,\s*0\)/);
   assert.match(gateSource, /stopDevStack\(config,\s*\{\s*purge:\s*true\s*\}\)/);
 });

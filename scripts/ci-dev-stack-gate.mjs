@@ -166,10 +166,40 @@ async function verifyStarterRoomAndCliPane(cookie) {
  */
 async function verifyResetCleanup() {
   console.log("Running dev:stack -- reset to verify full cleanup...");
+
+  // Capture all recorded dev-stack child PIDs before cleanup
+  const recordedPids = [];
+  if (existsSync(config.pidFile)) {
+    try {
+      const pidsObj = JSON.parse(readFileSync(config.pidFile, "utf8"));
+      for (const [name, pid] of Object.entries(pidsObj)) {
+        if (typeof pid === "number") {
+          recordedPids.push({ name, pid });
+        }
+      }
+    } catch {
+      // Ignore read error
+    }
+  }
+
   await stopDevStack(config, { purge: true });
 
   if (existsSync(config.stateRoot)) {
     throw new Error(`State root still exists after reset: ${config.stateRoot}`);
+  }
+
+  // Assert all recorded dev-stack child processes have exited
+  for (const { name, pid } of recordedPids) {
+    let running = false;
+    try {
+      process.kill(pid, 0);
+      running = true;
+    } catch {
+      running = false;
+    }
+    if (running) {
+      throw new Error(`Dev-stack child process '${name}' (PID ${pid}) is still running after reset`);
+    }
   }
 
   // Assert Compose project has no lingering containers
@@ -188,7 +218,7 @@ async function verifyResetCleanup() {
     throw new Error(`Compose project volumes still exist after reset: ${volCheck.stdout.trim()}`);
   }
 
-  console.log("Reset cleanup verified cleanly (state directory, containers, and volumes absent)!");
+  console.log("Reset cleanup verified cleanly (state directory, child processes, containers, and volumes absent)!");
 }
 
 /**
