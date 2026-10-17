@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
+  ensureSecrets,
   generateDevComposeYaml,
   parsePinnedImages,
   parsePinnedOpencodeVersion,
@@ -106,4 +110,75 @@ test("generateDevComposeYaml creates isolated compose configuration strictly bou
   assert.match(yaml, /secrets:\s*\n\s*postgres-password:\s*\n\s*file:/);
   assert.match(yaml, /image: pgvector\/pgvector:0\.8\.3/);
   assert.match(yaml, /image: temporalio\/auto-setup:1\.29\.1/);
+});
+
+/**
+ * Verifies that ensureSecrets generates owner-readable secrets (mode 0600) and is idempotent.
+ */
+test("ensureSecrets creates required secret files with proper modes and preserves existing secrets", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-secrets-"));
+  try {
+    const config = {
+      secretsDir: path.join(tmpDir, "secrets"),
+      runDir: path.join(tmpDir, "run"),
+      binDir: path.join(tmpDir, "bin"),
+      varDir: path.join(tmpDir, "var"),
+      workspacesDir: path.join(tmpDir, "workspaces"),
+      postgresPort: 54329
+    };
+
+    const firstSecrets = ensureSecrets(config);
+    assert.ok(firstSecrets.password && firstSecrets.password.length >= 32);
+    assert.ok(firstSecrets.sessionSecret && firstSecrets.sessionSecret.length >= 48);
+    assert.ok(firstSecrets.setupToken && firstSecrets.setupToken.length >= 32);
+    assert.equal(firstSecrets.databaseUrl, `postgresql://spaceapp:${firstSecrets.password}@127.0.0.1:54329/spaceapp`);
+
+    // Files exist on disk
+    assert.ok(fs.existsSync(path.join(config.secretsDir, "postgres-password")));
+    assert.ok(fs.existsSync(path.join(config.secretsDir, "session-secret")));
+    assert.ok(fs.existsSync(path.join(config.secretsDir, "setup-token")));
+    assert.ok(fs.existsSync(path.join(config.secretsDir, "database-url")));
+
+    // Idempotency: calling ensureSecrets again returns the exact same secrets
+    const secondSecrets = ensureSecrets(config);
+    assert.equal(secondSecrets.password, firstSecrets.password);
+    assert.equal(secondSecrets.sessionSecret, firstSecrets.sessionSecret);
+    assert.equal(secondSecrets.setupToken, firstSecrets.setupToken);
+    assert.equal(secondSecrets.databaseUrl, firstSecrets.databaseUrl);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that generateDevComposeYaml avoids container_name to prevent global conflicts and defines healthchecks.
+ */
+test("generateDevComposeYaml omits fixed container_name and defines healthchecks for postgres and temporal", () => {
+  const yaml = generateDevComposeYaml({
+    postgresImage: "pgvector/pgvector:0.8.3",
+    temporalImage: "temporalio/auto-setup:1.29.1",
+    postgresPort: 54329,
+    temporalPort: 57233,
+    secretsDir: "/path/to/secrets",
+    composeProject: "test-dev-project"
+  });
+
+  assert.doesNotMatch(yaml, /container_name:/);
+  assert.match(yaml, /healthcheck:\s*\n\s*test: \["CMD-SHELL", "pg_isready/);
+  assert.match(yaml, /temporal operator cluster health/);
+});
+
+/**
+ * Verifies that CONTRIBUTING.md documents Linux, macOS (Docker Desktop/Colima), and Windows 11 (WSL2).
+ */
+test("CONTRIBUTING.md documents all required platforms and commands", () => {
+  const contributing = fs.readFileSync(path.join(process.cwd(), "CONTRIBUTING.md"), "utf8");
+  assert.match(contributing, /Run the full app from source/);
+  assert.match(contributing, /npm run dev:stack/);
+  assert.match(contributing, /npm run dev:stack -- down/);
+  assert.match(contributing, /npm run dev:stack -- reset/);
+  assert.match(contributing, /macOS/);
+  assert.match(contributing, /Colima/);
+  assert.match(contributing, /Windows 11/);
+  assert.match(contributing, /WSL2/);
 });

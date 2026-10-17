@@ -170,7 +170,7 @@ volumes:
  * @param {ReturnType<typeof resolveDevStackConfig>} config
  * @returns {{ password: string, sessionSecret: string, setupToken: string, databaseUrl: string, setupTokenPath: string }}
  */
-function ensureSecrets(config) {
+export function ensureSecrets(config) {
   mkdirSync(config.secretsDir, { recursive: true });
   mkdirSync(config.runDir, { recursive: true });
   mkdirSync(config.binDir, { recursive: true });
