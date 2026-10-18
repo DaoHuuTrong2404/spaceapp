@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -800,24 +803,51 @@ test("startDevStack prevents concurrent execution when active lock is held", asy
 /**
  * Verifies that isManagedSocketPath correctly recognizes the fallback socket path in tmpdir.
  */
-test("isManagedSocketPath identifies fallback socket in tmpdir as managed", () => {
+test("isManagedSocketPath identifies fallback socket in tmpdir as managed", async () => {
   const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-fallback-"));
   try {
     const config = resolveDevStackConfig({
       SPACE_DEV_STATE_DIR: tmpState
     });
     const fallbackPath = resolveCliHostSocketFallback(config.runDir, config.composeProject);
-    fs.writeFileSync(fallbackPath, "");
 
-    const isManaged = isManagedSocketPath(fallbackPath, config);
-    assert.equal(isManaged, true, "Fallback socket in tmpdir must be recognized as managed");
+    if (process.platform !== "win32") {
+      // 1. Regular file fixture at fallback path must NOT be considered a managed socket on POSIX
+      fs.writeFileSync(fallbackPath, "");
+      assert.equal(isManagedSocketPath(fallbackPath, config), false, "Regular file at fallback path must not be recognized as socket on POSIX");
+      fs.rmSync(fallbackPath, { force: true });
 
-    // File in tmpdir with different name should NOT be managed
-    const unmanagedPath = path.join(os.tmpdir(), "unrelated-socket.sock");
-    fs.writeFileSync(unmanagedPath, "");
-    assert.equal(isManagedSocketPath(unmanagedPath, config), false, "Unrelated file in tmpdir must not be managed");
-    fs.rmSync(unmanagedPath, { force: true });
-    fs.rmSync(fallbackPath, { force: true });
+      // 2. Real Unix domain socket at fallback path must be recognized as managed
+      const server = net.createServer();
+      await new Promise((resolve) => server.listen(fallbackPath, resolve));
+      try {
+        assert.equal(isManagedSocketPath(fallbackPath, config), true, "Real Unix socket at fallback path must be recognized as managed");
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+        fs.rmSync(fallbackPath, { force: true });
+      }
+
+      // 3. Unrelated Unix domain socket with unique dynamic name in tmpdir must NOT be managed
+      const unrelatedPath = path.join(os.tmpdir(), `spaceapp-test-unrelated-${crypto.randomBytes(6).toString("hex")}.sock`);
+      const unrelatedServer = net.createServer();
+      await new Promise((resolve) => unrelatedServer.listen(unrelatedPath, resolve));
+      try {
+        assert.equal(isManagedSocketPath(unrelatedPath, config), false, "Unrelated Unix socket in tmpdir must not be managed");
+      } finally {
+        await new Promise((resolve) => unrelatedServer.close(resolve));
+        fs.rmSync(unrelatedPath, { force: true });
+      }
+    } else {
+      // On Windows, regular file fixture representing fallback socket
+      fs.writeFileSync(fallbackPath, "");
+      assert.equal(isManagedSocketPath(fallbackPath, config), true, "Fallback socket path must be recognized as managed on Windows");
+      fs.rmSync(fallbackPath, { force: true });
+
+      const unrelatedPath = path.join(os.tmpdir(), `spaceapp-test-unrelated-${crypto.randomBytes(6).toString("hex")}.sock`);
+      fs.writeFileSync(unrelatedPath, "");
+      assert.equal(isManagedSocketPath(unrelatedPath, config), false, "Unrelated path in tmpdir must not be managed on Windows");
+      fs.rmSync(unrelatedPath, { force: true });
+    }
   } finally {
     fs.rmSync(tmpState, { recursive: true, force: true });
   }
@@ -942,6 +972,157 @@ test("two contenders attempting startup concurrently: contender fails without cl
 
     // Winner's lock must remain untouched
     assert.equal(fs.readFileSync(lockFile, "utf8"), payloadWinner);
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that stopDevStack propagates teardown failure when supervisor writes unsuccessful shutdown.ack.
+ */
+test("stopDevStack propagates teardown failure from supervisor shutdown.ack", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-ack-fail-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+    fs.mkdirSync(config.runDir, { recursive: true });
+
+    // Spawn a mock supervisor that simulates dev-stack process
+    const mockSupervisorScript = `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const runDir = process.argv[1];
+      const ackFile = path.join(runDir, "shutdown.ack");
+      let handled = false;
+      const handleShutdown = () => {
+        if (handled) return;
+        handled = true;
+        try {
+          fs.writeFileSync(ackFile, JSON.stringify({ pid: process.pid, success: false, error: "Mock Docker teardown failed (exit code 1)" }));
+        } catch {}
+        process.exit(1);
+      };
+      process.on("SIGTERM", handleShutdown);
+      const reqFile = path.join(runDir, "shutdown.req");
+      const interval = setInterval(() => {
+        if (fs.existsSync(reqFile)) {
+          clearInterval(interval);
+          handleShutdown();
+        }
+      }, 50);
+    `;
+
+    const supervisorProc = spawn(process.execPath, [
+      "-e",
+      mockSupervisorScript,
+      config.runDir,
+      `spaceapp-dev-stack-${config.composeProject}`
+    ], { stdio: "ignore" });
+
+    // Give process 200ms to start
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Record supervisor in lock file
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    fs.writeFileSync(lockFile, JSON.stringify({ pid: supervisorProc.pid, createdAt: new Date().toISOString() }));
+
+    await assert.rejects(
+      async () => {
+        await stopDevStack(config, { purge: false });
+      },
+      /Supervisor failed during teardown: Mock Docker teardown failed/
+    );
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that stopDevStack with skipChildSignals: true skips sending signals to child PIDs.
+ */
+test("stopDevStack with skipChildSignals: true skips sending initial signals to child PIDs", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-skipsig-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+    fs.mkdirSync(config.runDir, { recursive: true });
+
+    // Write a dummy pidFile with an unverified or inactive PID
+    fs.writeFileSync(config.pidFile, JSON.stringify({ dummy: 99999999 }));
+
+    // Calling stopDevStack with skipChildSignals: true must not throw or attempt signals
+    await stopDevStack(config, { purge: false, skipChildSignals: true });
+
+    // pidFile should be cleaned up
+    assert.equal(fs.existsSync(config.pidFile), false);
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that concurrent contenders on stale dead lock are serialized via directory mutex
+ * with exactly one winner acquiring the lock and no lock vanishing or clobbering.
+ */
+test("concurrent contenders on stale lock are serialized via mutex with exactly one winner", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-concurrent-stale-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    const deadPayload = JSON.stringify({ pid: 99999999, createdAt: new Date(Date.now() - 30000).toISOString() });
+    fs.writeFileSync(lockFile, deadPayload);
+    const pastTime = (Date.now() - 30000) / 1000;
+    fs.utimesSync(lockFile, pastTime, pastTime);
+
+    // Run 2 contenders concurrently
+    let winnerCount = 0;
+    let refusalCount = 0;
+
+    const contender = async () => {
+      try {
+        await startDevStack(config, {
+          runCmd: async (bin, args) => {
+            if (bin === "docker" && args.includes("up")) {
+              winnerCount++;
+              // Hold at boundary to allow concurrent contender to attempt acquisition
+              await new Promise((r) => setTimeout(r, 200));
+              throw new Error("MOCK_COMPOSE_BOUNDARY_STOP");
+            }
+          }
+        });
+      } catch (err) {
+        if (err.message.includes("MOCK_COMPOSE_BOUNDARY_STOP")) {
+          return "winner";
+        }
+        if (err.message.includes("already running") || err.message.includes("already in progress")) {
+          refusalCount++;
+          return "refused";
+        }
+        throw err;
+      }
+    };
+
+    const results = await Promise.all([contender(), contender()]);
+    assert.equal(results.includes("winner"), true, "At least one contender must win lock reclaim");
+    assert.equal(winnerCount, 1, "Exactly one contender must reach Docker compose boundary");
+    assert.equal(refusalCount, 1, "The loser contender must be refused cleanly");
   } finally {
     fs.rmSync(tmpState, { recursive: true, force: true });
   }

@@ -248,7 +248,7 @@ export function ensureSecrets(config) {
   } else {
     if (existsSync(stateRoot)) {
       const existingEntries = readdirSync(stateRoot);
-      const nonLockEntries = existingEntries.filter((e) => e !== "dev-stack.lock");
+      const nonLockEntries = existingEntries.filter((e) => e !== "dev-stack.lock" && e !== "dev-stack.lock.mutex");
       if (nonLockEntries.length > 0) {
         throw new Error(`Refusing to adopt non-empty existing directory without .dev-stack-state.json marker as state root: ${stateRoot}`);
       }
@@ -667,15 +667,15 @@ export function isDevStackProcess(pid, expectedName, config) {
         cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ").toLowerCase();
       }
     } else if (process.platform === "win32") {
-      const res = spawnSync("powershell", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`], {
+      const res = spawnSync("powershell", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`], {
         encoding: "utf8",
-        timeout: 2000
+        timeout: 5000
       });
       if (res.stdout) {
         cmd = res.stdout.toLowerCase();
       }
     } else if (process.platform === "darwin") {
-      const res = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 2000 });
+      const res = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 5000 });
       if (res.stdout) {
         cmd = res.stdout.toLowerCase();
       }
@@ -732,13 +732,17 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand,
     if (supervisorAlive && isDevStackProcess(supervisorPid, "dev-stack", config)) {
       console.log(`Coordinating graceful shutdown with supervisor (PID: ${supervisorPid})...`);
       const reqFile = path.join(config.runDir, "shutdown.req");
+      const ackFile = path.join(config.runDir, "shutdown.ack");
+      try { rmSync(ackFile, { force: true }); } catch {}
       try {
         writeFileSync(reqFile, JSON.stringify({ requestedAt: Date.now(), supervisorPid, purge, requesterPid: process.pid }));
       } catch {}
 
-      try {
-        process.kill(supervisorPid, "SIGTERM");
-      } catch {}
+      if (process.platform !== "win32") {
+        try {
+          process.kill(supervisorPid, "SIGTERM");
+        } catch {}
+      }
 
       const supervisorDeadline = Date.now() + 10000;
       while (Date.now() < supervisorDeadline) {
@@ -752,6 +756,25 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand,
       }
 
       if (!supervisorAlive) {
+        let ackSuccess = null;
+        let ackError = null;
+        for (let a = 0; a < 5; a++) {
+          if (existsSync(ackFile)) {
+            try {
+              const ack = JSON.parse(readFileSync(ackFile, "utf8"));
+              if (ack.pid === supervisorPid) {
+                ackSuccess = ack.success === true;
+                ackError = ack.error || null;
+                break;
+              }
+            } catch {}
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        try { rmSync(ackFile, { force: true }); } catch {}
+        if (ackSuccess !== true) {
+          throw new Error(`Supervisor failed during teardown: ${ackError || "Teardown failed"}`);
+        }
         if (!purge) {
           return;
         }
@@ -872,7 +895,7 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand,
     } else {
       args.push("stop");
     }
-    const res = runCmd("docker", args, { stdio: "inherit" });
+    const res = await runCmd("docker", args, { stdio: "inherit" });
     if (res && typeof res.status === "number" && res.status !== 0) {
       throw new Error(`Failed to tear down Docker Compose services (${args.join(" ")}): exit code ${res.status}`);
     }
@@ -936,7 +959,7 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
 
   // Inspect directory contents BEFORE acquisition: refuse non-empty directory lacking marker without touching it
   if (existsSync(config.stateRoot) && !existsSync(markerPath)) {
-    const preEntries = readdirSync(config.stateRoot).filter((e) => e !== "dev-stack.lock");
+    const preEntries = readdirSync(config.stateRoot).filter((e) => e !== "dev-stack.lock" && e !== "dev-stack.lock.mutex");
     if (preEntries.length > 0) {
       throw new Error(`Refusing to adopt non-empty existing directory without .dev-stack-state.json marker as state root: ${config.stateRoot}`);
     }
@@ -944,20 +967,39 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
 
   mkdirSync(config.stateRoot, { recursive: true, mode: 0o700 });
 
-  // Atomically acquire state lock using flag: 'wx' (O_CREAT | O_EXCL) before any state mutation
+  // Serialize lock acquisition/reclaim via atomic directory mutex to avoid races between concurrent contenders
+  const mutexDir = path.join(config.stateRoot, "dev-stack.lock.mutex");
   const lockPayload = JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2) + "\n";
   let lockAcquired = false;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  let mutexAcquired = false;
+  for (let m = 0; m < 50; m++) {
     try {
+      mkdirSync(mutexDir, { mode: 0o700 });
+      mutexAcquired = true;
+      break;
+    } catch (mErr) {
+      if (mErr.code !== "EEXIST") throw mErr;
+      try {
+        const mutexAge = Date.now() - statSync(mutexDir).mtimeMs;
+        if (mutexAge > 10000) {
+          try { rmSync(mutexDir, { recursive: true, force: true }); } catch {}
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
+  if (!mutexAcquired) {
+    throw new Error(`Failed to acquire lock mutex for directory ${config.stateRoot}`);
+  }
+
+  try {
+    if (!existsSync(lockFile)) {
       writeFileSync(lockFile, lockPayload, { flag: "wx", mode: 0o600 });
       lockAcquired = true;
-      break;
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-
-      // Lock file already exists: inspect recording PID
-      // Give concurrent creator up to 500ms to finish writing payload
+    } else {
+      // Lock file exists: check if owner PID is alive or if lock is stale
       let rawContent = "";
       let parsedData = null;
       for (let r = 0; r < 5; r++) {
@@ -968,7 +1010,7 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
             break;
           }
         } catch {}
-        await new Promise((res) => setTimeout(res, 100));
+        await new Promise((res) => setTimeout(res, 50));
       }
 
       if (parsedData && typeof parsedData.pid === "number") {
@@ -982,7 +1024,6 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         }
       }
 
-      // If the file is still unreadable, check its age before considering it corrupted
       let fileAgeMs = 0;
       try {
         fileAgeMs = Date.now() - statSync(lockFile).mtimeMs;
@@ -992,31 +1033,16 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         throw new Error(`Dev stack startup is already in progress in state directory ${config.stateRoot}. Refusing concurrent start.`);
       }
 
-      // Stale dead lock (>15s old): atomically rename to serialize reclaim and avoid race with fresh creator
-      const reclaimPath = path.join(config.stateRoot, `dev-stack.lock.reclaim.${process.pid}`);
-      try {
-        renameSync(lockFile, reclaimPath);
-        const reclaimedContent = readFileSync(reclaimPath, "utf8").trim();
-        let isStale = false;
-        try {
-          const reclaimedData = JSON.parse(reclaimedContent);
-          if (reclaimedData.pid === parsedData?.pid) {
-            isStale = true;
-          }
-        } catch {
-          if (reclaimedContent === rawContent) isStale = true;
-        }
-
-        if (isStale) {
-          rmSync(reclaimPath, { force: true });
-        } else {
-          try { renameSync(reclaimPath, lockFile); } catch {}
-          throw new Error(`Concurrent lock acquisition detected in state directory ${config.stateRoot}. Refusing concurrent start.`);
-        }
-      } catch (renameErr) {
-        if (renameErr.message.includes("Concurrent lock acquisition")) throw renameErr;
-      }
+      // Lock is definitively stale (>15s old and owner dead or corrupted):
+      // Safely unlink and write new lock while holding directory mutex
+      rmSync(lockFile, { force: true });
+      writeFileSync(lockFile, lockPayload, { flag: "wx", mode: 0o600 });
+      lockAcquired = true;
     }
+  } finally {
+    try {
+      rmSync(mutexDir, { recursive: true, force: true });
+    } catch {}
   }
 
   if (!lockAcquired) {
@@ -1059,10 +1085,22 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         await new Promise((r) => setTimeout(r, 100));
       }
 
+      const ackFile = path.join(config.runDir, "shutdown.ack");
+      let teardownSuccess = false;
+      let teardownError = null;
       try {
         await stopDevStack(config, { purge: false, runCmd, skipChildSignals: true });
+        teardownSuccess = true;
       } catch (e) {
         console.error("[dev-stack] Teardown error:", e.message);
+        teardownError = e.message;
+      }
+
+      try {
+        writeFileSync(ackFile, JSON.stringify({ pid: process.pid, success: teardownSuccess, error: teardownError }));
+      } catch {}
+
+      if (!teardownSuccess) {
         process.exit(1);
       }
       process.exit(exitCode);
@@ -1098,7 +1136,7 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         try { rmSync(shutdownReqFile, { force: true }); } catch {}
       }
     }
-  }, 400);
+  }, 100);
   shutdownWatcher.unref();
 
   try {
@@ -1122,7 +1160,7 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
   writeFileSync(composeFile, composeYaml, "utf8");
 
   console.log(`Starting Docker dependencies (postgres and temporal, project: ${config.composeProject})...`);
-  runCmd("docker", ["compose", "-p", config.composeProject, "-f", composeFile, "up", "-d"]);
+  await runCmd("docker", ["compose", "-p", config.composeProject, "-f", composeFile, "up", "-d"]);
 
   console.log(`Waiting for PostgreSQL on 127.0.0.1:${config.postgresPort}...`);
   await waitForPort(config.postgresPort, "127.0.0.1", 60000);
@@ -1347,7 +1385,7 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
         } catch {}
       }
       try {
-        await stopDevStack(config, { purge: false, runCmd });
+        await stopDevStack(config, { purge: false, runCmd, skipChildSignals: true });
       } catch (cleanupErr) {
         console.error("[dev-stack] Error during rollback teardown:", cleanupErr.message);
       }
@@ -1399,11 +1437,21 @@ async function main() {
   const config = resolveDevStackConfig();
 
   if (args.includes("down") || args.includes("--down")) {
-    await stopDevStack(config, { purge: false });
+    try {
+      await stopDevStack(config, { purge: false });
+    } catch (err) {
+      console.error(`[dev-stack] Down failed: ${err.message}`);
+      process.exit(1);
+    }
     return;
   }
   if (args.includes("reset") || args.includes("--reset")) {
-    await stopDevStack(config, { purge: true });
+    try {
+      await stopDevStack(config, { purge: true });
+    } catch (err) {
+      console.error(`[dev-stack] Reset failed: ${err.message}`);
+      process.exit(1);
+    }
     return;
   }
   if (args.includes("status") || args.includes("--status")) {
