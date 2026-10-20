@@ -20,6 +20,7 @@ import {
   setupOpencodeWrapper,
   startDevStack,
   stopDevStack,
+  teardownOrphanedChildren,
   validatePort
 } from "../dev-stack.mjs";
 
@@ -1124,6 +1125,106 @@ test("concurrent contenders on stale lock are serialized via mutex with exactly 
     assert.equal(winnerCount, 1, "Exactly one contender must reach Docker compose boundary");
     assert.equal(refusalCount, 1, "The loser contender must be refused cleanly");
   } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that dev-stack environment wires SPACE_SKILL_BUNDLES_ROOT to repo root
+ * and SPACE_PROVIDER_SKILL_LINKS_ROOT to opencode CLI state.
+ */
+test("dev-stack environment wires SPACE_SKILL_BUNDLES_ROOT and provider-recognized SPACE_PROVIDER_SKILL_LINKS_ROOT", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /SPACE_SKILL_BUNDLES_ROOT:\s*path\.join\(ROOT,\s*["']agent-skills["']\)/);
+  assert.match(devStackSource, /SPACE_PROVIDER_SKILL_LINKS_ROOT:\s*path\.join\(config\.stateRoot,\s*["']cli-state["'],\s*["']opencode["'],\s*["']\.agents["'],\s*["']skills["']\)/);
+
+  const pluginsSource = fs.readFileSync(path.join(process.cwd(), "apps", "api", "src", "plugins-service.ts"), "utf8");
+  assert.match(pluginsSource, /process\.env\.SPACE_SKILL_BUNDLES_ROOT/);
+});
+
+/**
+ * Verifies that publicScripts and publicRepositoryScripts in scripts/public-export.mjs include dev-stack artifacts.
+ */
+test("publicScripts and publicRepositoryScripts in scripts/public-export.mjs include dev-stack artifacts", () => {
+  const exportSource = fs.readFileSync(path.join(process.cwd(), "scripts", "public-export.mjs"), "utf8");
+  const required = [
+    "scripts/dev-stack.mjs",
+    "scripts/ci-dev-stack-gate.mjs",
+    "scripts/watch-packages.mjs",
+    "scripts/tests/dev-stack.test.mjs"
+  ];
+  for (const script of required) {
+    assert.match(exportSource, new RegExp(`"${script}"`));
+  }
+});
+
+/**
+ * Verifies that startDevStack cleans up orphaned child processes recorded in pidFile on stale lock reclamation.
+ */
+test("startDevStack terminates orphaned child processes on stale lock recovery", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-orphan-cleanup-"));
+  let child = null;
+  try {
+    fs.writeFileSync(
+      path.join(tmpState, ".dev-stack-state.json"),
+      JSON.stringify({ createdBy: "spaceapp-dev-stack", stateRoot: tmpState })
+    );
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+    fs.mkdirSync(config.runDir, { recursive: true });
+
+    // Spawn a dummy process that matches stack ownership
+    const dummyScript = path.join(tmpState, "spaceapp-dev-stack-dummy.mjs");
+    fs.writeFileSync(dummyScript, "setInterval(() => {}, 1000);");
+    child = spawn(process.execPath, [dummyScript], { stdio: "ignore" });
+    assert.ok(child.pid, "Child process must have a PID");
+
+    await new Promise((r) => setTimeout(r, 150));
+
+    let childAlive = false;
+    try {
+      process.kill(child.pid, 0);
+      childAlive = true;
+    } catch {}
+    assert.equal(childAlive, true, "Dummy child must be alive initially");
+
+    fs.writeFileSync(config.pidFile, JSON.stringify({ "spaceapp-child": child.pid }));
+
+    const lockFile = path.join(tmpState, "dev-stack.lock");
+    const deadPayload = JSON.stringify({ pid: 99999999, createdAt: new Date(Date.now() - 30000).toISOString() });
+    fs.writeFileSync(lockFile, deadPayload);
+    const pastTime = (Date.now() - 30000) / 1000;
+    fs.utimesSync(lockFile, pastTime, pastTime);
+
+    await assert.rejects(
+      async () => {
+        await startDevStack(config, {
+          runCmd: () => {
+            throw new Error("MOCK_COMPOSE_BOUNDARY_STOP");
+          }
+        });
+      },
+      /MOCK_COMPOSE_BOUNDARY_STOP/
+    );
+
+    let childStillAlive = false;
+    try {
+      process.kill(child.pid, 0);
+      childStillAlive = true;
+    } catch {}
+    assert.equal(childStillAlive, false, "Orphaned child process must be terminated by stale lock reclamation");
+    assert.equal(fs.existsSync(config.pidFile), false, "pidFile must be cleaned up");
+  } finally {
+    if (child && child.pid) {
+      try {
+        if (process.platform === "win32") {
+          spawn("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
+        } else {
+          process.kill(child.pid, "SIGKILL");
+        }
+      } catch {}
+    }
     fs.rmSync(tmpState, { recursive: true, force: true });
   }
 });

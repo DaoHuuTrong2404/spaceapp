@@ -698,6 +698,92 @@ export function isDevStackProcess(pid, expectedName, config) {
 }
 
 /**
+ * Terminates any orphaned child processes from a previous dead supervisor.
+ *
+ * @param {ReturnType<typeof resolveDevStackConfig>} config
+ * @returns {Promise<void>}
+ */
+export async function teardownOrphanedChildren(config) {
+  if (!existsSync(config.pidFile)) return;
+  const recordedPids = [];
+  try {
+    const pids = JSON.parse(readFileSync(config.pidFile, "utf8"));
+    for (const [name, val] of Object.entries(pids)) {
+      const pid = typeof val === "number" ? val : val?.pid;
+      if (typeof pid === "number") {
+        if (isDevStackProcess(pid, name, config)) {
+          recordedPids.push(pid);
+        } else {
+          console.warn(`[dev-stack] Skipping unverified PID ${pid} (${name}); not identified as dev-stack process.`);
+        }
+      }
+    }
+    for (const pid of recordedPids) {
+      try {
+        if (process.platform === "win32") {
+          spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+        } else {
+          process.kill(pid, "SIGTERM");
+        }
+      } catch {}
+    }
+  } catch {}
+
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const alive = recordedPids.filter((pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (alive.length === 0) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  const lingeringPids = recordedPids.filter((pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  if (lingeringPids.length > 0) {
+    for (const pid of lingeringPids) {
+      try {
+        if (process.platform === "win32") {
+          spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+        } else {
+          process.kill(pid, "SIGKILL");
+        }
+      } catch {}
+    }
+
+    const postKillDeadline = Date.now() + 1500;
+    while (Date.now() < postKillDeadline) {
+      const stillLingering = lingeringPids.filter((pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      if (stillLingering.length === 0) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  try {
+    rmSync(config.pidFile, { force: true });
+  } catch {}
+}
+
+/**
  * Stops running dev-stack child processes and Docker Compose services.
  *
  * @param {ReturnType<typeof resolveDevStackConfig>} config
@@ -1034,6 +1120,8 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
       }
 
       // Lock is definitively stale (>15s old and owner dead or corrupted):
+      // Teardown any orphaned child processes from dead supervisor before replacing lock
+      await teardownOrphanedChildren(config);
       // Safely unlink and write new lock while holding directory mutex
       rmSync(lockFile, { force: true });
       writeFileSync(lockFile, lockPayload, { flag: "wx", mode: 0o600 });
@@ -1221,7 +1309,8 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
     SPACE_USER_PROJECTS_ROOT: path.join(config.varDir, "user-projects"),
     SPACE_CLI_RUNTIME_VISIBILITY_FILE: path.join(config.varDir, "cli-runtime-visibility.json"),
     SPACE_PLUGIN_STORAGE_ROOT: path.join(config.varDir, "plugins"),
-    SPACE_PROVIDER_SKILL_LINKS_ROOT: path.join(config.varDir, "provider-skill-links"),
+    SPACE_SKILL_BUNDLES_ROOT: path.join(ROOT, "agent-skills"),
+    SPACE_PROVIDER_SKILL_LINKS_ROOT: path.join(config.stateRoot, "cli-state", "opencode", ".agents", "skills"),
     SPACEAPP_WORKFLOWS_ENABLED: "true",
     SPACE_API_HOST: "127.0.0.1",
     SPACE_API_PORT: String(config.apiPort),

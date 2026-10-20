@@ -524,9 +524,11 @@ const SKILL_DIRS = process.env.SPACE_PROVIDER_SKILL_LINKS_ROOT
 
 function findSkillSourceDir(folder: string): string | null {
   const candidates = [
+    ...(process.env.SPACE_SKILL_BUNDLES_ROOT ? [join(process.env.SPACE_SKILL_BUNDLES_ROOT, folder)] : []),
     join("/opt/spaceapp/agent-skills", folder),
     join("/app/agent-skills", folder),
-    join(process.cwd(), "agent-skills", folder)
+    join(process.cwd(), "agent-skills", folder),
+    join(process.cwd(), "..", "..", "agent-skills", folder)
   ];
   for (const c of candidates) {
     if (existsSync(c)) return c;
