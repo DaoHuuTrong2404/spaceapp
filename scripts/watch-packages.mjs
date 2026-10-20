@@ -15,15 +15,20 @@ const PACKAGES_DIR = path.join(ROOT, "packages");
 export function rebuildPackages() {
   return new Promise((resolve) => {
     console.log(`\n[watch:packages] Package file change detected. Rebuilding packages...`);
+    let settled = false;
     const proc = spawn(process.platform === "win32" ? "npm.cmd" : "npm", ["run", "build:packages"], {
       cwd: ROOT,
       stdio: "inherit"
     });
     proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       console.error("[watch:packages] Spawn error:", err.message);
       resolve(1);
     });
     proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
       if (code === 0) {
         console.log(`[watch:packages] Packages rebuilt successfully.\n`);
       } else {

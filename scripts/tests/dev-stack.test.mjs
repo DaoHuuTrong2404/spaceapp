@@ -1258,6 +1258,16 @@ test("isDevStackProcess identifies API process running tsx watch in generic path
     const isApiMatch = isDevStackProcess(child.pid, "api", config);
     assert.equal(isApiMatch, true, "isDevStackProcess must return true for API tsx watch process");
 
+    // Matches API process when stateRoot is passed with forward slashes
+    const forwardSlashMatch = isDevStackProcess(child.pid, "api", { stateRoot: tmpState.replaceAll("\\", "/") });
+    assert.equal(forwardSlashMatch, true, "isDevStackProcess must match when stateRoot uses forward slashes");
+
+    // Rejects invalid PIDs safely without error or unexpected signaling
+    assert.equal(isDevStackProcess(-1, "api", config), false, "Must reject negative PID");
+    assert.equal(isDevStackProcess(0, "api", config), false, "Must reject zero PID");
+    assert.equal(isDevStackProcess(NaN, "api", config), false, "Must reject NaN PID");
+    assert.equal(isDevStackProcess("invalid", "api", config), false, "Must reject non-number PID");
+
     // Rejects process when checked against an unrelated stateRoot / checkout
     const unrelatedMatch = isDevStackProcess(child.pid, "api", { stateRoot: path.join(os.tmpdir(), "unrelated-dir") });
     assert.equal(unrelatedMatch, false, "isDevStackProcess must reject process belonging to a different root");

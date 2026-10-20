@@ -650,7 +650,7 @@ export function isManagedSocketPath(socketPath, config) {
  * @returns {boolean}
  */
 export function isDevStackProcess(pid, expectedName, config) {
-  if (!pid || typeof pid !== "number") return false;
+  if (!pid || typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
   } catch {
@@ -675,25 +675,38 @@ export function isDevStackProcess(pid, expectedName, config) {
         cmd = res.stdout.toLowerCase();
       }
     } else if (process.platform === "darwin") {
-      const res = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 5000 });
+      const res = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 5000 });
       if (res.stdout) {
         cmd = res.stdout.toLowerCase();
       }
     }
     if (!cmd) return false;
 
+    // Normalize slashes to make matching resilient against forward/backward slash differences on Windows
+    const cmdNorm = cmd.replaceAll("\\", "/");
+    const rootNorm = rootLower.replaceAll("\\", "/");
+    const stateNorm = stateLower ? stateLower.replaceAll("\\", "/") : null;
+    const projectNorm = projectLower ? projectLower.replaceAll("\\", "/") : null;
+
     // Verify ownership by this checkout / stack root / project, NOT just any node process
-    const matchesCheckout = cmd.includes(rootLower) || (stateLower && cmd.includes(stateLower)) || (projectLower && cmd.includes(projectLower));
+    const matchesCheckout =
+      cmd.includes(rootLower) ||
+      cmdNorm.includes(rootNorm) ||
+      (stateLower && cmd.includes(stateLower)) ||
+      (stateNorm && cmdNorm.includes(stateNorm)) ||
+      (projectLower && cmd.includes(projectLower)) ||
+      (projectNorm && cmdNorm.includes(projectNorm));
+
     const matchesName =
-      cmd.includes("spaceapp") ||
-      cmd.includes("dev-stack") ||
-      cmd.includes("@space") ||
-      cmd.includes("vite") ||
-      cmd.includes("tsx") ||
-      cmd.includes("server.ts") ||
-      cmd.includes("apps/api") ||
+      cmdNorm.includes("spaceapp") ||
+      cmdNorm.includes("dev-stack") ||
+      cmdNorm.includes("@space") ||
+      cmdNorm.includes("vite") ||
+      cmdNorm.includes("tsx") ||
+      cmdNorm.includes("server.ts") ||
+      cmdNorm.includes("apps/api") ||
       cmd.includes("apps\\api") ||
-      (expectedName && cmd.includes(expectedName.toLowerCase()));
+      (expectedName && cmdNorm.includes(expectedName.toLowerCase()));
 
     return Boolean(matchesCheckout && matchesName);
   } catch {
