@@ -689,6 +689,10 @@ export function isDevStackProcess(pid, expectedName, config) {
       cmd.includes("dev-stack") ||
       cmd.includes("@space") ||
       cmd.includes("vite") ||
+      cmd.includes("tsx") ||
+      cmd.includes("server.ts") ||
+      cmd.includes("apps/api") ||
+      cmd.includes("apps\\api") ||
       (expectedName && cmd.includes(expectedName.toLowerCase()));
 
     return Boolean(matchesCheckout && matchesName);
@@ -904,19 +908,21 @@ export async function stopDevStack(config, { purge = false, runCmd = runCommand,
       // Ignore pidfile read errors
     }
 
-    // 1. Initial wait for SIGTERM: up to 5s deadline
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      const alive = recordedPids.filter((pid) => {
-        try {
-          process.kill(pid, 0);
-          return true;
-        } catch {
-          return false;
-        }
-      });
-      if (alive.length === 0) break;
-      await new Promise((r) => setTimeout(r, 200));
+    // 1. Initial wait for SIGTERM: up to 5s deadline (only if child signals were just sent)
+    if (!skipChildSignals) {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const alive = recordedPids.filter((pid) => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch {
+            return false;
+          }
+        });
+        if (alive.length === 0) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
     }
 
     // 2. Identify only lingering PIDs that are actually still alive

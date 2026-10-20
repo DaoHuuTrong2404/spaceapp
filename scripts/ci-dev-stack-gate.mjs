@@ -519,6 +519,8 @@ async function verifyResetCleanup(preRecordedPids = []) {
   for (const port of [config.apiPort, config.webPort, config.postgresPort, config.temporalPort]) {
     const isBound = await new Promise((resolve) => {
       const s = new net.Socket();
+      s.setTimeout(2000);
+      s.once("timeout", () => { s.destroy(); resolve(false); });
       s.once("connect", () => { s.destroy(); resolve(true); });
       s.once("error", () => { s.destroy(); resolve(false); });
       s.connect(port, "127.0.0.1");

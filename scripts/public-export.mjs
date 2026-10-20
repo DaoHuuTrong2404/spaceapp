@@ -605,7 +605,15 @@ export async function createPublicExport({
       if (metadata?.mode && !/^100(?:644|755)$/.test(metadata.mode)) {
         throw new Error(`Public export accepts regular Git files only: ${path}`);
       }
-      const original = await readFile(sourcePath);
+      let original = await readFile(sourcePath);
+      if (metadata?.objectId && gitObjectHash(original, metadata.objectId) !== metadata.objectId) {
+        if (isText(original) && original.includes("\r\n")) {
+          const normalizedEol = Buffer.from(original.toString("utf8").replaceAll("\r\n", "\n"), "utf8");
+          if (gitObjectHash(normalizedEol, metadata.objectId) === metadata.objectId) {
+            original = normalizedEol;
+          }
+        }
+      }
       if (metadata?.objectId && gitObjectHash(original, metadata.objectId) !== metadata.objectId) {
         throw new Error(`Tracked file does not match ${sourceCommit}: ${path}`);
       }

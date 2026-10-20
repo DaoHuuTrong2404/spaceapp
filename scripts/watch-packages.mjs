@@ -19,6 +19,10 @@ export function rebuildPackages() {
       cwd: ROOT,
       stdio: "inherit"
     });
+    proc.on("error", (err) => {
+      console.error("[watch:packages] Spawn error:", err.message);
+      resolve(1);
+    });
     proc.on("close", (code) => {
       if (code === 0) {
         console.log(`[watch:packages] Packages rebuilt successfully.\n`);

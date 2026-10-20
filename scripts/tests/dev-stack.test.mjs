@@ -11,6 +11,7 @@ import {
   ensureSecrets,
   generateDevComposeYaml,
   isComposeServiceHealthy,
+  isDevStackProcess,
   isManagedSocketPath,
   parsePinnedImages,
   parsePinnedOpencodeVersion,
@@ -1228,3 +1229,60 @@ test("startDevStack terminates orphaned child processes on stale lock recovery",
     fs.rmSync(tmpState, { recursive: true, force: true });
   }
 });
+
+/**
+ * Verifies that isDevStackProcess correctly matches an API process running tsx watch src/server.ts
+ * even in a generic directory path that does not contain "spaceapp".
+ */
+test("isDevStackProcess identifies API process running tsx watch in generic path without spaceapp", async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "generic-checkout-test-"));
+  assert.equal(tmpState.toLowerCase().includes("spaceapp"), false, "tmpState path must not contain spaceapp");
+
+  let child = null;
+  try {
+    const fakeCli = path.join(tmpState, "apps", "api", "node_modules", "tsx", "dist", "cli.mjs");
+    fs.mkdirSync(path.dirname(fakeCli), { recursive: true });
+    fs.writeFileSync(fakeCli, "setInterval(() => {}, 1000);");
+
+    child = spawn(process.execPath, [fakeCli, "watch", "src/server.ts"], {
+      cwd: os.tmpdir(),
+      stdio: "ignore"
+    });
+    assert.ok(child.pid, "Child process must have a PID");
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const config = { stateRoot: tmpState };
+
+    // Matches API process despite generic path lacking "spaceapp"
+    const isApiMatch = isDevStackProcess(child.pid, "api", config);
+    assert.equal(isApiMatch, true, "isDevStackProcess must return true for API tsx watch process");
+
+    // Rejects process when checked against an unrelated stateRoot / checkout
+    const unrelatedMatch = isDevStackProcess(child.pid, "api", { stateRoot: path.join(os.tmpdir(), "unrelated-dir") });
+    assert.equal(unrelatedMatch, false, "isDevStackProcess must reject process belonging to a different root");
+  } finally {
+    if (child && child.pid) {
+      try {
+        if (process.platform === "win32") {
+          const { spawnSync } = await import("node:child_process");
+          spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
+        } else {
+          process.kill(child.pid, "SIGKILL");
+        }
+      } catch {}
+      for (let i = 0; i < 10; i++) {
+        try {
+          process.kill(child.pid, 0);
+          await new Promise((r) => setTimeout(r, 50));
+        } catch {
+          break;
+        }
+      }
+    }
+    try {
+      fs.rmSync(tmpState, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {}
+  }
+});
+
