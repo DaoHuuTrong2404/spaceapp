@@ -1296,3 +1296,84 @@ test("isDevStackProcess identifies API process running tsx watch in generic path
   }
 });
 
+
+/**
+ * Verifies that dev-stack environment isolates host T3 Code and enables skill-link synchronization.
+ */
+test("dev-stack environment isolates host T3 Code and enables skill-link synchronization", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /SPACE_T3CODE_ENABLED:\s*["']false["']/);
+  assert.match(devStackSource, /SPACE_T3CODE_SOCKET:\s*["']disabled["']/);
+  assert.match(devStackSource, /SPACE_INSTANCE_ENABLED_JOBS:\s*["']plugin-skill-links["']/);
+});
+
+/**
+ * Verifies that setupOpencodeWrapper creates direct opencode shim and passes --save-exact.
+ */
+test("setupOpencodeWrapper creates direct opencode CLI shim and passes --save-exact", () => {
+  const devStackSource = fs.readFileSync(path.join(process.cwd(), "scripts", "dev-stack.mjs"), "utf8");
+  assert.match(devStackSource, /opencodeShimPath\s*=\s*path\.join\(config\.binDir,\s*["']opencode["']\)/);
+  assert.match(devStackSource, /--save-exact/);
+
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-opencode-shim-"));
+  try {
+    const config = resolveDevStackConfig({
+      SPACE_DEV_STATE_DIR: tmpState
+    });
+    fs.mkdirSync(config.opencodeDir, { recursive: true });
+    fs.mkdirSync(config.binDir, { recursive: true });
+    const binFile = path.join(config.opencodeDir, "node_modules", ".bin", process.platform === "win32" ? "opencode.cmd" : "opencode");
+    fs.mkdirSync(path.dirname(binFile), { recursive: true });
+    fs.writeFileSync(binFile, "#!/bin/sh\necho opencode\n");
+    const pkgJson = path.join(config.opencodeDir, "package.json");
+    fs.writeFileSync(pkgJson, JSON.stringify({ dependencies: { "opencode-ai": "1.18.4" } }));
+
+    setupOpencodeWrapper(config, "1.18.4");
+
+    const shim = path.join(config.binDir, "opencode");
+    assert.ok(fs.existsSync(shim), "Direct opencode shim must exist");
+    const shimContent = fs.readFileSync(shim, "utf8");
+    assert.match(shimContent, /HOME=/);
+    assert.match(shimContent, /XDG_CONFIG_HOME=/);
+
+    if (process.platform === "win32") {
+      const cmdShim = path.join(config.binDir, "opencode.cmd");
+      assert.ok(fs.existsSync(cmdShim), "Direct opencode.cmd shim must exist on Windows");
+      const cmdContent = fs.readFileSync(cmdShim, "utf8");
+      assert.match(cmdContent, /set "HOME=/);
+    }
+  } finally {
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Verifies that ensureSecrets refreshes expired owner setup token (>15m) on restart if unclaimed.
+ */
+test("ensureSecrets refreshes expired owner setup token on restart if unclaimed", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "spaceapp-test-expired-token-"));
+  try {
+    const config = {
+      secretsDir: path.join(tmpDir, "secrets"),
+      runDir: path.join(tmpDir, "run"),
+      binDir: path.join(tmpDir, "bin"),
+      varDir: path.join(tmpDir, "var"),
+      workspacesDir: path.join(tmpDir, "workspaces"),
+      postgresPort: 54329
+    };
+
+    const initial = ensureSecrets(config);
+    const initialToken = initial.setupToken;
+    assert.ok(initialToken);
+
+    const pastTime = (Date.now() - 20 * 60 * 1000) / 1000;
+    fs.utimesSync(initial.setupTokenPath, pastTime, pastTime);
+
+    const refreshed = ensureSecrets(config);
+    assert.notEqual(refreshed.setupToken, initialToken, "Expired token must be refreshed with a new token");
+    assert.ok(refreshed.setupTokenPath);
+    assert.equal(fs.readFileSync(refreshed.setupTokenPath, "utf8").trim(), refreshed.setupToken);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

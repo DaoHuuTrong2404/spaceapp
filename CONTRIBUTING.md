@@ -76,6 +76,8 @@ This single command:
 5. Runs database migrations against the isolated development database.
 6. Starts the background Temporal worker, API service, and Vite web development server with hot-module replacement.
 
+On first start, a one-time owner setup token is printed in the terminal. If left unclaimed past its 15-minute TTL, restarting `npm run dev:stack` automatically refreshes the setup token and bootstrap state for the unclaimed stack without requiring a destructive reset.
+
 ### Development service endpoints
 
 | Service | Local Endpoint | Description |

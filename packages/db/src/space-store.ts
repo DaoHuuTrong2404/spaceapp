@@ -4107,7 +4107,13 @@ export class PostgresSpaceStore implements SpaceStore {
           updated_at
         )
         VALUES (true, $1, $2, now())
-        ON CONFLICT (singleton) DO NOTHING
+        ON CONFLICT (singleton)
+        DO UPDATE SET
+          setup_token_hash = EXCLUDED.setup_token_hash,
+          setup_token_expires_at = EXCLUDED.setup_token_expires_at,
+          updated_at = now()
+        WHERE space_owner_setup.owner_user_id IS NULL
+          AND space_owner_setup.setup_token_expires_at <= now()
       `,
       [input.tokenHash, input.expiresAt]
     );

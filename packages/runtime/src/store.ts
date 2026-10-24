@@ -2830,6 +2830,12 @@ export class InMemorySpaceStore implements SpaceStore {
         onboardingCompletedAt: null,
         starterRoomId: null
       };
+    } else if (
+      this.ownerSetup.ownerUserId === null &&
+      Date.parse(this.ownerSetup.expiresAt) <= Date.now()
+    ) {
+      this.ownerSetup.tokenHash = input.tokenHash;
+      this.ownerSetup.expiresAt = input.expiresAt;
     }
     return this.getOwnerSetupStatus();
   }

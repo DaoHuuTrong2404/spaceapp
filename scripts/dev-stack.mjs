@@ -293,7 +293,10 @@ export function ensureSecrets(config) {
   if (!existsSync(sessionPath)) {
     writeFileSync(sessionPath, crypto.randomBytes(32).toString("hex") + "\n", { mode: 0o600 });
   }
+  const setupTokenExpired = existsSync(setupTokenPath) && (Date.now() - statSync(setupTokenPath).mtimeMs >= 15 * 60 * 1000);
   if (isInitialSetup && !existsSync(setupTokenPath)) {
+    writeFileSync(setupTokenPath, crypto.randomBytes(24).toString("hex") + "\n", { mode: 0o600 });
+  } else if (setupTokenExpired) {
     writeFileSync(setupTokenPath, crypto.randomBytes(24).toString("hex") + "\n", { mode: 0o600 });
   }
 
@@ -470,7 +473,7 @@ export function setupOpencodeWrapper(config, opencodeVersion) {
   if (needsInstall) {
     writeFileSync(pkgJsonPath, JSON.stringify({ name: "dev-stack-opencode", private: true, dependencies: { "opencode-ai": opencodeVersion } }, null, 2) + "\n");
     console.log(`Installing pinned opencode-ai@${opencodeVersion} into state directory...`);
-    runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--no-audit", "--no-fund", `opencode-ai@${opencodeVersion}`], {
+    runCommand(process.platform === "win32" ? "npm.cmd" : "npm", ["install", "--save-exact", "--no-audit", "--no-fund", `opencode-ai@${opencodeVersion}`], {
       cwd: config.opencodeDir
     });
   }
@@ -520,6 +523,24 @@ case "\${1:-}" in
 esac
 `;
   writeFileSync(parityPath, wrapperContent, { mode: 0o755 });
+  // Direct opencode CLI wrapper isolating HOME and XDG variables on direct calls
+  const opencodeShimPath = path.join(config.binDir, "opencode");
+  const opencodeShimContent = `#!/usr/bin/env bash
+set -euo pipefail
+export PATH="${config.opencodeDir}/node_modules/.bin:\$PATH"
+export USER=spaceapp
+export LOGNAME=spaceapp
+export HOME="${opencodeStateDir}"
+export TMPDIR="${opencodeTmpDir}"
+export TMP="${opencodeTmpDir}"
+export TEMP="${opencodeTmpDir}"
+export XDG_CONFIG_HOME="${opencodeStateDir}/config"
+export XDG_DATA_HOME="${opencodeStateDir}/data"
+export XDG_CACHE_HOME="${opencodeStateDir}/cache"
+export XDG_STATE_HOME="${opencodeStateDir}/state"
+exec "${config.opencodeDir}/node_modules/.bin/opencode" "\$@"
+`;
+  writeFileSync(opencodeShimPath, opencodeShimContent, { mode: 0o755 });
 
   if (process.platform === "win32") {
     const cmdPath = path.join(config.binDir, "opencode-vscode-parity.cmd");
@@ -550,6 +571,22 @@ if "%~1"=="credential-smoke" (
 "${opencodeBin}" %*
 `;
     writeFileSync(cmdPath, cmdContent);
+    const opencodeCmdPath = path.join(config.binDir, "opencode.cmd");
+    const opencodeCmdContent = `@echo off
+set "PATH=${config.opencodeDir}\\node_modules\\.bin;%PATH%"
+set "USER=spaceapp"
+set "LOGNAME=spaceapp"
+set "HOME=${opencodeStateDir.replaceAll("/", "\\")}"
+set "TMPDIR=${opencodeTmpDir.replaceAll("/", "\\")}"
+set "TMP=${opencodeTmpDir.replaceAll("/", "\\")}"
+set "TEMP=${opencodeTmpDir.replaceAll("/", "\\")}"
+set "XDG_CONFIG_HOME=${opencodeStateDir.replaceAll("/", "\\")}\\config"
+set "XDG_DATA_HOME=${opencodeStateDir.replaceAll("/", "\\")}\\data"
+set "XDG_CACHE_HOME=${opencodeStateDir.replaceAll("/", "\\")}\\cache"
+set "XDG_STATE_HOME=${opencodeStateDir.replaceAll("/", "\\")}\\state"
+"${opencodeBin}" %*
+`;
+    writeFileSync(opencodeCmdPath, opencodeCmdContent);
   }
 }
 
@@ -1314,10 +1351,12 @@ export async function startDevStack(config, { runCmd = runCommand } = {}) {
     SPACE_TEMPORAL_ADDRESS: `127.0.0.1:${config.temporalPort}`,
     SPACE_RUNTIME_STORE: "postgres",
     SPACE_INSTANCE: "dev",
-    SPACE_INSTANCE_ENABLED_JOBS: "",
+    SPACE_INSTANCE_ENABLED_JOBS: "plugin-skill-links",
     SPACE_TEMPORAL_NAMESPACE: "dev",
     SPACE_TEMPORAL_TASK_QUEUE: "space-dev-agent-turns",
     SPACE_CLI_ROOT_ENABLED: "false",
+    SPACE_T3CODE_ENABLED: "false",
+    SPACE_T3CODE_SOCKET: "disabled",
     SPACE_BROWSER_HOST_TRANSPORT: "disabled",
     SPACE_BROWSER_SESSIONS_ENABLED: "false",
     SPACE_DOT_TOOL_GATEWAY: "disabled",
